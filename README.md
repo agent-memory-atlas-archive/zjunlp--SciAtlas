@@ -794,9 +794,9 @@ or reinstall:
 If you find SciAtlas helpful, please cite:
 
 ```
-@misc{qiao2026sciatlaslargescaleknowledgegraph,
-      title={SciAtlas: A Large-Scale Knowledge Graph for Automated Scientific Research}, 
-      author={Shuofei Qiao and Yunxiang Wei and Jiazheng Fan and Bin Wu and Busheng Zhang and Mengru Wang and Yuqi Zhu and Ningyu Zhang and Keyan Ding and Qiang Zhang and Huajun Chen},
+@misc{qiao2026sciatlascomputableatlasscience,
+      title={SciAtlas: A Computable Atlas of Science for Knowledge-Grounded AI Research}, 
+      author={Shuofei Qiao and Yunxiang Wei and Busheng Zhang and Mengru Wang and Jiazheng Fan and Huadong Jian and Bin Wu and Shumin Deng and Yida Xue and Zifan Cheng and Xiang Chen and Dan Zhang and Junfeng Fang and Ningyu Zhang and Keyan Ding and Qiang Zhang and Jeff Z. Pan and Emine Yilmaz and Huajun Chen},
       year={2026},
       eprint={2605.22878},
       archivePrefix={arXiv},
