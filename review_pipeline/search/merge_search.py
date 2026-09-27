@@ -31,7 +31,7 @@ DEFAULT_CACHE_PATH = BASE_DIR / "target"
 RESULT_DIR = BASE_DIR / "result"
 RESULT_MARKDOWN = RESULT_DIR / "merge_search_log.md"
 DMX_API_URL = "https://www.dmxapi.cn/v1/chat/completions"
-DEFAULT_DMX_MODEL = "deepseek-v3.2"
+DEFAULT_DMX_MODEL = "DeepSeek-V3.2"
 DEFAULT_LLM_BATCH_SIZE = 4
 DEFAULT_LLM_PAPER_COVERAGE = 2
 TITLE_STOPWORDS = {
@@ -72,8 +72,57 @@ for extra_path in (INNOEVAL_DIR, S2API_DIR):
     if extra_path_str not in sys.path:
         sys.path.insert(0, extra_path_str)
 
-from kg_search.service import run_search_with_authors as run_kg_search  # noqa: E402
 import search_s2 as s2_search  # noqa: E402
+
+
+def _run_local_kg_search(kg_args: argparse.Namespace) -> dict:
+    from kg_search.service import run_search_with_authors
+
+    return run_search_with_authors(kg_args)
+
+
+def _run_hosted_kg_search(kg_args: argparse.Namespace) -> dict:
+    from kg_search.service_hosted import run_search_with_authors
+
+    return run_search_with_authors(kg_args)
+
+
+def _load_env_file_values(env_path: str | None) -> dict:
+    if not env_path:
+        return {}
+    path = Path(env_path).expanduser()
+    if not path.is_file():
+        return {}
+    values: dict = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def resolve_kg_backend(args: argparse.Namespace) -> str:
+    """Pick the KG retrieval backend: local Neo4j, hosted SciAtlas API, or none."""
+    backend = str(
+        getattr(args, "kg_backend", "") or os.environ.get("KG_BACKEND", "") or "auto"
+    ).strip().lower()
+    if backend in {"hosted", "local", "none"}:
+        return backend
+    env_values = _load_env_file_values(getattr(args, "env", None))
+
+    def _env_present(*names: str) -> bool:
+        return any(
+            str(os.environ.get(name) or "").strip() or str(env_values.get(name) or "").strip()
+            for name in names
+        )
+
+    if _env_present("NEO4J_PASSWORD"):
+        return "local"
+    if _env_present("SCIATLAS_API_KEY"):
+        return "hosted"
+    return "none"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,6 +134,16 @@ def build_parser() -> argparse.ArgumentParser:
     input_group.add_argument("--pdf-path", help="PDF path used for retrieval.")
 
     parser.add_argument("--kg-top-k", type=int, default=20, help="Top-k paper count returned from KG search.")
+    parser.add_argument(
+        "--kg-backend",
+        choices=("auto", "hosted", "local", "none"),
+        default=None,
+        help=(
+            "KG retrieval backend: 'local' (Neo4j on this machine), 'hosted' (SciAtlas API, needs "
+            "SCIATLAS_API_KEY), 'none' (skip KG), or 'auto' (default: local when NEO4J_PASSWORD is "
+            "configured, else hosted when SCIATLAS_API_KEY is configured, else none)."
+        ),
+    )
     parser.add_argument("--s2-top-k", type=int, default=20, help="Top-k paper count returned from S2 search.")
     parser.add_argument(
         "--s2-mode",
@@ -260,6 +319,7 @@ def build_kg_args(args: argparse.Namespace) -> argparse.Namespace:
         idea_text=args.idea_text,
         pdf_path=args.pdf_path,
         top_k=args.kg_top_k,
+        env=getattr(args, "env", None),
         target_field=args.target_field,
         after=args.after,
         before=args.before,
@@ -1571,11 +1631,23 @@ def run_combined_search(args: argparse.Namespace) -> dict[str, Any]:
                 cache_info["reused_sources"].append("s2")
 
     if "kg" not in source_payloads:
-        tasks["kg"] = (
-            run_kg_search,
-            build_kg_args(args),
-            _build_kg_payload,
-        )
+        kg_backend = resolve_kg_backend(args)
+        if kg_backend == "none":
+            source_payloads["kg"] = {
+                "source": "kg",
+                "status": "skipped",
+                "error_type": "KgBackendDisabled",
+                "error": "KG backend disabled: set NEO4J_PASSWORD (local) or SCIATLAS_API_KEY (hosted), or pass --kg-backend",
+                "papers": [],
+                "authors": [],
+                "elapsed_ms": 0.0,
+            }
+        else:
+            tasks["kg"] = (
+                _run_hosted_kg_search if kg_backend == "hosted" else _run_local_kg_search,
+                build_kg_args(args),
+                _build_kg_payload,
+            )
 
     if "s2" not in source_payloads:
         tasks["s2"] = (

@@ -75,6 +75,8 @@ def run_real(payload: dict[str, Any], work_dir: Path, cuda_visible_devices: str 
         search_top_k=int(payload["search_top_k"]) if payload.get("search_top_k") is not None else 50,
         search_final_k=int(payload["search_final_k"]) if payload.get("search_final_k") is not None else 15,
         max_workers=int(payload["max_workers"]) if payload.get("max_workers") is not None else DEFAULT_MAX_WORKERS,
+        precomputed_root=normalize_whitespace(payload.get("precomputed_root")),
+        search_mode=normalize_whitespace(payload.get("search_mode")),
         embed_device=normalize_whitespace(payload.get("embed_device")) or default_embed_device,
         rerank_device=normalize_whitespace(payload.get("rerank_device")) or default_rerank_device,
     )

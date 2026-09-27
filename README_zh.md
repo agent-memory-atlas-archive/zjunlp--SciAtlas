@@ -219,6 +219,22 @@ set GROBID_BASE_URL=http://127.0.0.1:8070
 
 用户需要编辑的配置模板：[.env.example](.env.example#L47-L48)。不处理本地 PDF 时可以留空。
 
+🧪 必需：idea 评审所需的 embedding / rerank 模型
+
+idea-evaluate 的 rubric 分支和 grounding 阶段需要两个本地模型：`bge-large-en-v1.5`（向量化）和 `bge-reranker-large`（重排序）。一次性下载到 `<repo>/models/`（各约 1.3GB）——工作流会**自动探测该目录，无需配置任何环境变量**：
+
+```bash
+pip install -r requirements-rubric.txt
+export HF_ENDPOINT=https://hf-mirror.com   # 国内镜像；可直连 huggingface.co 时无需设置
+huggingface-cli download BAAI/bge-large-en-v1.5 --local-dir models/bge-large-en-v1.5
+huggingface-cli download BAAI/bge-reranker-large --local-dir models/bge-reranker-large
+python scripts/download_rubric_assets.py   # 预计算 NC 论文产物 + FAISS 索引（~160MB）
+python scripts/check_rubric_setup.py       # 环境体检；缺什么会打印对应的修复命令
+python run_rubric.py --idea "你的研究想法"
+```
+
+目录名必须严格为 `models/bge-large-en-v1.5` 和 `models/bge-reranker-large`——资产包中的 FAISS 索引由 `bge-large-en-v1.5`（1024 维）构建，换其他 embedding 模型将导致向量空间不匹配。模型放在其他位置时，可用 `RUBRIC_EMBED_MODEL_PATH` / `RUBRIC_RERANK_MODEL_PATH` / `INNOEVAL_EMBEDDING_MODEL_PATH` / `SCIATLAS_EMBEDDING_MODEL_PATH`（绝对路径）显式指定。国内用户也可走 ModelScope 下载；完整核对清单见 [agent-skill/sciatlas-idea-evaluate/SKILL.md](agent-skill/sciatlas-idea-evaluate/SKILL.md#local-model-setup)。无 GPU 也可运行；共享 GPU 机器上建议设置 `INNOEVAL_CUDA_DEVICES` 指定空闲卡。
+
 运行时变量说明：
 
 | 变量 | 所需场景 | 说明 |
@@ -235,6 +251,8 @@ set GROBID_BASE_URL=http://127.0.0.1:8070
 | `GROBID_BASE_URL` | PDF 任务 | 使用 `--pdf-path` 工作流时需要。 |
 | `OA_API_KEY` | 可选 | OpenAlex 元数据 / PDF 支持。 |
 | `OPENALEX_MAILTO` | 可选 | OpenAlex 联系邮箱。 |
+| `RUBRIC_EMBED_MODEL_PATH` / `RUBRIC_RERANK_MODEL_PATH` | 仅当模型不在 `<repo>/models/` 时 | 指向 `bge-large-en-v1.5` / `bge-reranker-large` 的绝对路径。 |
+| `INNOEVAL_CUDA_DEVICES` | 可选 | 本地推理使用的 GPU 编号，如 `0,7`；不设置时使用 CPU。 |
 
 ### 4. 测试
 

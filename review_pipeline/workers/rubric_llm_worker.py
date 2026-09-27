@@ -103,6 +103,7 @@ def run_real(payload: dict[str, Any], work_dir: Path, cuda_visible_devices: str 
         if payload.get("llm_timeout_seconds") is not None
         else 120,
         max_workers=int(payload["max_workers"]) if payload.get("max_workers") is not None else DEFAULT_MAX_WORKERS,
+        precomputed_root=normalize_whitespace(payload.get("precomputed_root")),
     )
 
     result = run_rubric_llm(config)

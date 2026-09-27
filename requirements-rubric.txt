@@ -1,0 +1,20 @@
+# Dependencies for the rubric branch (run_rubric.py and the rubric workers).
+# Default local mode: sentence-transformers models downloaded into <repo>/models/
+# (see README quickstart / agent-skill/sciatlas-idea-evaluate/SKILL.md).
+faiss-cpu>=1.8
+numpy>=1.24
+pydantic>=2,<3
+requests>=2.28
+openai>=1.40,<2
+json-repair>=0.30
+httpx>=0.27,<1
+pdfplumber>=0.11
+huggingface_hub>=0.23
+torch>=2.1
+sentence-transformers>=3,<4
+
+# Optional:
+# - Regenerating precomputed artifacts from raw sources (Europe PMC XML / review
+#   PDFs) additionally needs:  pip install PyMuPDF beautifulsoup4 lxml
+# - Running purely against a remote embeddings API (EMBED_API_*, no local
+#   models): torch and sentence-transformers can be omitted.

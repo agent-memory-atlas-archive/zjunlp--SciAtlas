@@ -27,7 +27,7 @@ SEARCH_DIR = Path(__file__).resolve().parent
 DEFAULT_ENV_PATH = REPO_ROOT.parent / ".env"
 DEFAULT_INPUT_PATH = SEARCH_DIR / "result" / "20260324_212717_merge_search.json"
 DEFAULT_OUTPUT_ROOT = SEARCH_DIR / "result" / "pdf_xml_pipeline"
-DEFAULT_GROBID_BASE_URL = "http://127.0.0.1:8070"
+DEFAULT_GROBID_BASE_URL = os.getenv("GROBID_BASE_URL") or "http://127.0.0.1:8070"
 OPENALEX_API_BASE = "https://api.openalex.org"
 OPENALEX_CONTENT_BASE = "https://content.openalex.org"
 USER_AGENT = "innoeval-search-pdf-xml-pipeline/1.0"
@@ -541,7 +541,8 @@ class OpenAlexClient:
 
     def _build_url(self, base_url: str, params: dict[str, Any]) -> str:
         query_params = {key: value for key, value in params.items() if value not in {None, ""}}
-        query_params["api_key"] = self.api_key
+        if self.api_key:
+            query_params["api_key"] = self.api_key
         if self.mailto:
             query_params["mailto"] = self.mailto
         return f"{base_url}?{urllib.parse.urlencode(query_params)}"
@@ -1189,9 +1190,14 @@ class PdfXmlPipeline:
 def build_config(args: argparse.Namespace) -> tuple[PipelineConfig, urllib.request.OpenerDirector]:
     env_path = Path(args.env).resolve()
     env_values = load_env_values(env_path)
-    openalex_api_key = env_values.get("OA-API-KEY") or env_values.get("OA_API_KEY")
+    openalex_api_key = env_values.get("OA-API-KEY") or env_values.get("OA_API_KEY") or ""
     if not openalex_api_key:
-        raise PipelineError(f"OpenAlex API key not found in {env_path}. Tried OA-API-KEY and OA_API_KEY.")
+        print(
+            "[pdf_xml_pipeline] WARNING: OA-API-KEY not found in "
+            f"{env_path}; falling back to the OpenAlex public pool "
+            "(set OPENALEX_MAILTO for polite-pool priority).",
+            file=sys.stderr,
+        )
 
     output_root = Path(args.output_root).resolve()
     output_dir = build_run_dir(output_root, args.result_tag).resolve()

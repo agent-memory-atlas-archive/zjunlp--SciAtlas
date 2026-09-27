@@ -68,11 +68,13 @@ def resolve_llm_settings(
         env_values,
         "LLM_API_KEY",
         "OPENAI_API_KEY",
+        "DMX_API_KEY",
+        "DMX-API-KEY",
     )
     if require_api_key and not api_key:
         raise ValueError(
             f"Missing LLM API key in {env_path}. "
-            "Set LLM_API_KEY (preferred) or OPENAI_API_KEY (legacy)."
+            "Set LLM_API_KEY (preferred), OPENAI_API_KEY or DMX-API-KEY (legacy)."
         )
 
     raw_base_url = _first_param_value(params, base_url_keys) or get_env_value(

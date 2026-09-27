@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 DEFAULT_LLM_API_URL = "https://www.dmxapi.cn/v1/chat/completions"
-DEFAULT_LLM_MODEL = "deepseek-v3.2"
+DEFAULT_LLM_MODEL = "DeepSeek-V3.2"
 DEFAULT_SEARCH_ENV_PATH = Path(os.getenv("SCIATLAS_WORKFLOW_ENV", ".env")).expanduser()
 DEFAULT_EMBEDDING_MODEL_PATH = "/home/weiyunxiang/yunx/hf-models/BAAI--bge-large-en-v1.5"
 DEFAULT_RERANKER_MODEL_PATH = "/home/weiyunxiang/yunx/hf-models/BAAI--bge-reranker-large"
