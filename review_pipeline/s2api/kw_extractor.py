@@ -14,7 +14,7 @@ from typing import Any
 
 
 API_URL = "https://www.dmxapi.cn/v1/chat/completions"
-DEFAULT_MODEL = "deepseek-v3.2"
+DEFAULT_MODEL = "DeepSeek-V3.2"
 DEFAULT_ENV_PATH = Path("/home/weiyunxiang/yunx/.env")
 DEFAULT_TIMEOUT = 60
 

@@ -19,6 +19,16 @@ NON_RETRYABLE_ERROR_MARKERS = (
 )
 
 
+def validate_payload_schema(payload: Any, response_model_schema: Any) -> None:
+    """Raise when the parsed payload does not satisfy the pydantic response schema.
+
+    Guards against models echoing the prompt schema back as the answer, which
+    parses as valid JSON but carries no data.
+    """
+    if isinstance(response_model_schema, type) and issubclass(response_model_schema, BaseModel):
+        response_model_schema.model_validate(payload)
+
+
 def schema_json(response_model_schema: Any) -> str:
     if isinstance(response_model_schema, dict):
         schema = response_model_schema
@@ -60,7 +70,9 @@ def call_llm_json_with_retry(
         effective_system_prompt = system_prompt
         if attempt > 0:
             effective_system_prompt += (
-                "\n\nPrevious attempts returned invalid JSON. Output only a valid JSON object. "
+                "\n\nPrevious attempts returned invalid JSON or echoed the schema itself. "
+                "Output only a valid JSON object filled with your actual answer data; never return "
+                "the schema, its property definitions, or placeholder content. "
                 "Inside JSON strings, every backslash must be escaped as a double backslash. "
                 "For example, write \\\\alpha, \\\\hat{x}, and \\\\text{...}; never write a single "
                 "backslash before a letter."
@@ -108,16 +120,26 @@ def call_llm_json_with_retry(
         elapsed_ms = round((time.perf_counter() - attempt_started_at) * 1000, 1)
         if isinstance(result, dict) and result.get("status") == "ok":
             payload = result.get("payload")
-            if log_attempt is not None:
-                log_attempt(
-                    label=label,
-                    attempt=attempt + 1,
-                    status="ok",
-                    elapsed_ms=elapsed_ms,
-                    prompt_chars=len(user_content),
-                    repaired_json=bool(result.get("repaired_json")),
-                )
-            return payload if isinstance(payload, dict) else None
+            validation_error = ""
+            if not isinstance(payload, dict):
+                validation_error = f"payload is not a JSON object: {type(payload).__name__}"
+            else:
+                try:
+                    validate_payload_schema(payload, response_model_schema)
+                except Exception as exc:
+                    validation_error = f"schema validation failed: {exc.__class__.__name__}: {str(exc)[:200]}"
+            if not validation_error:
+                if log_attempt is not None:
+                    log_attempt(
+                        label=label,
+                        attempt=attempt + 1,
+                        status="ok",
+                        elapsed_ms=elapsed_ms,
+                        prompt_chars=len(user_content),
+                        repaired_json=bool(result.get("repaired_json")),
+                    )
+                return payload
+            result = {"status": "error", "error": validation_error}
 
         if log_attempt is not None:
             if isinstance(result, dict):

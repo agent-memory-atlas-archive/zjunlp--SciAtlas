@@ -231,6 +231,22 @@ set GROBID_BASE_URL=http://127.0.0.1:8070
 
 User-editable template: [.env.example](.env.example#L47-L48). Leave `GROBID_BASE_URL` empty unless you process local PDFs.
 
+🧪 Required: embedding / rerank models for idea evaluation
+
+The idea-evaluate rubric branch and the grounding stage need two local models: `bge-large-en-v1.5` (embedding) and `bge-reranker-large` (reranking). Download them once into `<repo>/models/` (~1.3GB each) — the workflow **auto-detects them there, no environment variables required**:
+
+```bash
+pip install -r requirements-rubric.txt
+export HF_ENDPOINT=https://hf-mirror.com   # mainland-China mirror; omit when huggingface.co is reachable
+huggingface-cli download BAAI/bge-large-en-v1.5 --local-dir models/bge-large-en-v1.5
+huggingface-cli download BAAI/bge-reranker-large --local-dir models/bge-reranker-large
+python scripts/download_rubric_assets.py   # precomputed NC-paper artifacts + FAISS index (~160MB)
+python scripts/check_rubric_setup.py       # pre-flight check; prints fixes for anything missing
+python run_rubric.py --idea "your research idea"
+```
+
+The directory names must be exactly `models/bge-large-en-v1.5` and `models/bge-reranker-large` — the FAISS index in the asset pack was built with `bge-large-en-v1.5` (1024 dims), so other embedding models will not match. Models stored elsewhere can be pinned via `RUBRIC_EMBED_MODEL_PATH` / `RUBRIC_RERANK_MODEL_PATH` / `INNOEVAL_EMBEDDING_MODEL_PATH` / `SCIATLAS_EMBEDDING_MODEL_PATH` (absolute paths). Mainland-China users can also download via ModelScope; the full checklist is in [agent-skill/sciatlas-idea-evaluate/SKILL.md](agent-skill/sciatlas-idea-evaluate/SKILL.md#local-model-setup). No GPU is required; on shared machines set `INNOEVAL_CUDA_DEVICES` to free GPU ids.
+
 Runtime variables:
 
 | Variable | Required For | Notes |
@@ -247,6 +263,8 @@ Runtime variables:
 | `GROBID_BASE_URL` | PDF tasks | Needed for `--pdf-path` workflows. |
 | `OA_API_KEY` | optional | OpenAlex metadata/PDF support. |
 | `OPENALEX_MAILTO` | optional | OpenAlex contact email. |
+| `RUBRIC_EMBED_MODEL_PATH` / `RUBRIC_RERANK_MODEL_PATH` | only when models live outside `<repo>/models/` | Absolute paths to `bge-large-en-v1.5` / `bge-reranker-large`. |
+| `INNOEVAL_CUDA_DEVICES` | optional | GPU ids for local inference, e.g. `0,7`; CPU is used when unset. |
 
 ### 4. Test
 

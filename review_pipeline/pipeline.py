@@ -242,6 +242,25 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
         default=300,
         help="Per-call timeout for rubric LLM requests.",
     )
+    parser.add_argument(
+        "--rubric-search-mode",
+        default=None,
+        choices=["auto", "local", "api"],
+        help=(
+            "Rubric paper retrieval backend: 'local' loads sentence-transformers models, "
+            "'api' uses a remote OpenAI-compatible embeddings endpoint (EMBED_API_*), "
+            "'auto' picks api when EMBED_API_BASE_URL is configured."
+        ),
+    )
+    parser.add_argument(
+        "--rubric-precomputed-root",
+        default=None,
+        help=(
+            "Root of the precomputed rubric asset pack containing papers/<folder_name>/"
+            "{summary.json,dimensions.json,review_text.txt,extracted_sections.json}. "
+            "Defaults to <repo>/assets/rubric when present."
+        ),
+    )
     parser.add_argument("--disable-review-stage", action="store_true", help="Skip reviewer evaluation stage.")
     parser.add_argument("--disable-report-stage", action="store_true", help="Skip report synthesis stage.")
     parser.add_argument(
@@ -3166,6 +3185,8 @@ def main(argv: list[str] | None = None) -> int:
                     "disable_rubric",
                     "rubric_search_top_k",
                     "rubric_search_final_k",
+                    "rubric_search_mode",
+                    "rubric_precomputed_root",
                 ]
                 rubric_sources_cache_keys = cache_key_union(idea_context_cache_keys, rubric_sources_own_cache_keys)
                 rubric_sources_cache_allowed = cache_allowed(
@@ -3209,6 +3230,12 @@ def main(argv: list[str] | None = None) -> int:
                         "search_final_k": args.rubric_search_final_k,
                         "max_workers": args.rubric_max_workers,
                         "llm_timeout_seconds": args.rubric_llm_timeout_seconds,
+                        "search_mode": args.rubric_search_mode or "",
+                        "precomputed_root": (
+                            str(Path(args.rubric_precomputed_root).expanduser().resolve())
+                            if args.rubric_precomputed_root
+                            else ""
+                        ),
                         "embed_device": device_at(cuda_devices, 0),
                         "rerank_device": device_at(cuda_devices, 1) or device_at(cuda_devices, 0),
                     }
@@ -3492,6 +3519,11 @@ def main(argv: list[str] | None = None) -> int:
                         "env_path": str(Path(args.env).expanduser().resolve()),
                         "max_workers": args.rubric_max_workers,
                         "llm_timeout_seconds": args.rubric_llm_timeout_seconds,
+                        "precomputed_root": (
+                            str(Path(args.rubric_precomputed_root).expanduser().resolve())
+                            if args.rubric_precomputed_root
+                            else ""
+                        ),
                     }
                     rubric_llm_future = executor.submit(
                         launch_worker,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,13 @@ from .persona import DEFAULT_PERSONA_JSON_PATH, DEFAULT_PERSONA_SUBJECT, select_
 DEFAULT_NEO4J_URI = "neo4j://localhost:7687"
 DEFAULT_NEO4J_USER = "neo4j"
 DEFAULT_NEO4J_PASSWORD = "weiyunxiang"
-DEFAULT_EMBEDDING_MODEL_NAME = "/data1/bge-model/AI-ModelScope/bge-large-en-v1.5"
+_REPO_MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
+_LOCAL_EMBED_MODEL = _REPO_MODELS_DIR / "bge-large-en-v1.5"
+DEFAULT_EMBEDDING_MODEL_NAME = (
+    os.getenv("INNOEVAL_EMBEDDING_MODEL_PATH")
+    or os.getenv("RUBRIC_EMBED_MODEL_PATH")
+    or (str(_LOCAL_EMBED_MODEL) if _LOCAL_EMBED_MODEL.is_dir() else "/data1/bge-model/AI-ModelScope/bge-large-en-v1.5")
+)
 DEFAULT_TOP_K_RELEVANT = 40
 DEFAULT_LLM_BASE_URL = "https://www.dmxapi.cn/v1"
 DEFAULT_LLM_MODEL_NAME = "DeepSeek-V3.2"

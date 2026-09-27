@@ -7,14 +7,15 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import os
 import re
+import requests
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from ..llm import resolve_llm_settings
 from ..llm.client import build_llm_client
@@ -25,9 +26,56 @@ DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 DEFAULT_MANIFEST_PATH = PROJECT_ROOT / "runs" / "pdf_manifest" / "manifest.json"
 DEFAULT_TARGET_DIR = Path("/tmp/sciatlas_grounding/target")
 DEFAULT_RESULT_DIR = Path("/tmp/sciatlas_grounding/result")
-DEFAULT_EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
-DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-large"
+_LOCAL_MODELS_DIR = PROJECT_ROOT / "models"
+
+
+def _resolve_local_model(dirname: str, hf_repo_id: str) -> str:
+    candidate = _LOCAL_MODELS_DIR / dirname
+    return str(candidate) if candidate.is_dir() else hf_repo_id
+
+
+DEFAULT_EMBEDDING_MODEL = (
+    os.getenv("SCIATLAS_EMBEDDING_MODEL_PATH")
+    or os.getenv("INNOEVAL_EMBEDDING_MODEL_PATH")
+    or _resolve_local_model("bge-large-en-v1.5", "BAAI/bge-large-en-v1.5")
+)
+DEFAULT_RERANKER_MODEL = (
+    os.getenv("SCIATLAS_RERANKER_MODEL_PATH")
+    or os.getenv("INNOEVAL_RERANKER_MODEL_PATH")
+    or _resolve_local_model("bge-reranker-large", "BAAI/bge-reranker-large")
+)
 DEFAULT_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+DEFAULT_EMBED_API_MODEL = "BAAI/bge-large-en-v1.5"
+DEFAULT_RERANK_API_MODEL = "BAAI/bge-reranker-v2-m3"
+EMBED_API_BATCH_CHUNK = 32
+RERANK_API_BATCH_CHUNK = 32
+
+
+def _api_env(*names: str) -> str:
+    for name in names:
+        value = str(os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def resolve_inference_mode() -> str:
+    """Return 'api' when a remote embeddings endpoint is configured, else 'local'.
+
+    SCIATLAS_SEARCH_MODE=local|api overrides the auto-detection; the same switch
+    is shared with the rubric retrieval backend (review_pipeline/review/idea_rubric.py).
+    """
+    mode = (_api_env("SCIATLAS_SEARCH_MODE", "GROUNDING_SEARCH_MODE") or "auto").lower()
+    if mode in {"local", "api"}:
+        return mode
+    base_url = _api_env("EMBED_API_BASE_URL", "EMBED_API_URL")
+    api_key = _api_env("EMBED_API_KEY", "LLM_API_KEY", "OPENAI_API_KEY", "DMX_API_KEY", "DMX-API-KEY")
+    return "api" if base_url and api_key else "local"
+
+
+def _join_api_url(base_url: str, suffix: str) -> str:
+    url = base_url.rstrip("/")
+    return url if url.endswith(f"/{suffix}") else f"{url}/{suffix}"
 EXTRACTION_SYSTEM_PROMPT = (
     "You are an expert scientific analysis agent. "
     "Transform a research idea or paper into structured, atomic, evaluation-ready research components. "
@@ -587,6 +635,8 @@ class DenseEncoder:
         query_prefix: str,
         device: str | None = None,
     ) -> None:
+        from sentence_transformers import SentenceTransformer
+
         kwargs: dict[str, Any] = {}
         if device:
             kwargs["device"] = device
@@ -619,6 +669,8 @@ class ParagraphReranker:
         batch_size: int,
         device: str | None = None,
     ) -> None:
+        from sentence_transformers import CrossEncoder
+
         kwargs: dict[str, Any] = {}
         if device:
             kwargs["device"] = device
@@ -635,6 +687,133 @@ class ParagraphReranker:
             show_progress_bar=False,
         )
         return [float(score) for score in scores]
+
+
+class ApiDenseEncoder:
+    """Dense encoder backed by a remote OpenAI-compatible /embeddings endpoint."""
+
+    def __init__(
+        self,
+        *,
+        batch_size: int,
+        query_prefix: str,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        self.base_url = _join_api_url(
+            base_url or _api_env("EMBED_API_BASE_URL", "EMBED_API_URL"),
+            "embeddings",
+        )
+        self.api_key = api_key or _api_env("EMBED_API_KEY", "LLM_API_KEY", "OPENAI_API_KEY", "DMX_API_KEY", "DMX-API-KEY")
+        self.model = model or _api_env("EMBED_API_MODEL") or DEFAULT_EMBED_API_MODEL
+        self.chunk_size = max(min(int(batch_size or EMBED_API_BATCH_CHUNK), EMBED_API_BATCH_CHUNK), 1)
+        self.query_prefix = query_prefix
+        if not base_url and not _api_env("EMBED_API_BASE_URL", "EMBED_API_URL"):
+            raise ValueError("ApiDenseEncoder requires EMBED_API_BASE_URL")
+        if not self.api_key:
+            raise ValueError("ApiDenseEncoder requires EMBED_API_KEY (or an LLM API key)")
+
+    def _embed(self, texts: list[str]) -> np.ndarray:
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), self.chunk_size):
+            chunk = texts[start : start + self.chunk_size]
+            response = requests.post(
+                self.base_url,
+                json={"model": self.model, "input": chunk},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=180,
+            )
+            response.raise_for_status()
+            data = response.json().get("data") or []
+            ordered = sorted(data, key=lambda item: item.get("index", 0) if isinstance(item, dict) else 0)
+            vectors.extend([item["embedding"] for item in ordered if isinstance(item, dict)])
+        if len(vectors) != len(texts):
+            raise RuntimeError(f"embeddings API returned {len(vectors)} vectors for {len(texts)} inputs")
+        array = np.asarray(vectors, dtype=np.float32)
+        norms = np.linalg.norm(array, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return array / norms
+
+    def encode_paragraphs(self, texts: list[str]) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, 0), dtype=np.float32)
+        return self._embed(list(texts))
+
+    def encode_queries(self, texts: list[str]) -> np.ndarray:
+        prefixed = [f"{self.query_prefix}{text}" if self.query_prefix else text for text in texts]
+        return self.encode_paragraphs(prefixed)
+
+
+class ApiParagraphReranker:
+    """Paragraph reranker backed by a remote /rerank endpoint (SiliconFlow/Jina style)."""
+
+    def __init__(
+        self,
+        *,
+        batch_size: int,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        resolved_base = base_url or _api_env("RERANK_API_BASE_URL", "RERANK_API_URL")
+        self.url = _join_api_url(resolved_base, "rerank") if resolved_base else ""
+        self.api_key = api_key or _api_env("RERANK_API_KEY") or _api_env(
+            "EMBED_API_KEY", "LLM_API_KEY", "OPENAI_API_KEY", "DMX_API_KEY", "DMX-API-KEY"
+        )
+        self.model = model or _api_env("RERANK_API_MODEL") or DEFAULT_RERANK_API_MODEL
+        self.chunk_size = max(min(int(batch_size or RERANK_API_BATCH_CHUNK), RERANK_API_BATCH_CHUNK), 1)
+        if not self.url:
+            raise ValueError("ApiParagraphReranker requires RERANK_API_BASE_URL")
+        if not self.api_key:
+            raise ValueError("ApiParagraphReranker requires RERANK_API_KEY (or an LLM API key)")
+
+    def score(self, query_text: str, paragraph_texts: list[str]) -> list[float]:
+        if not paragraph_texts:
+            return []
+        scores: list[float] = [0.0] * len(paragraph_texts)
+        for start in range(0, len(paragraph_texts), self.chunk_size):
+            chunk = paragraph_texts[start : start + self.chunk_size]
+            response = requests.post(
+                self.url,
+                json={"model": self.model, "query": query_text, "documents": chunk, "top_n": len(chunk)},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=180,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            results = payload.get("results") if isinstance(payload.get("results"), list) else payload.get("data")
+            if not isinstance(results, list):
+                continue
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                position = item.get("index")
+                score = item.get("relevance_score", item.get("score"))
+                if isinstance(position, int) and 0 <= position < len(chunk) and score is not None:
+                    scores[start + position] = float(score)
+        return scores
+
+
+def build_dense_encoder(args: argparse.Namespace) -> Any:
+    if resolve_inference_mode() == "api":
+        return ApiDenseEncoder(batch_size=args.embedding_batch_size, query_prefix=args.query_prefix)
+    return DenseEncoder(
+        normalize_model_name_or_path(args.embedding_model),
+        batch_size=args.embedding_batch_size,
+        query_prefix=args.query_prefix,
+        device=args.device,
+    )
+
+
+def build_paragraph_reranker(args: argparse.Namespace) -> Any:
+    if resolve_inference_mode() == "api":
+        return ApiParagraphReranker(batch_size=args.reranker_batch_size)
+    return ParagraphReranker(
+        normalize_model_name_or_path(args.reranker_model),
+        batch_size=args.reranker_batch_size,
+        device=args.device,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1878,8 +2057,12 @@ def run_grounding(args: argparse.Namespace) -> dict[str, Any]:
     manifest_path = Path(args.manifest).expanduser().resolve()
     corpus_root = resolve_corpus_root(manifest_path, args.papers_root)
     target_dir = Path(args.target_dir).expanduser().resolve()
+    inference_mode = resolve_inference_mode()
     embedding_model = normalize_model_name_or_path(args.embedding_model)
     reranker_model = normalize_model_name_or_path(args.reranker_model)
+    if inference_mode == "api":
+        embedding_model = f"api:{_api_env('EMBED_API_MODEL') or DEFAULT_EMBED_API_MODEL}"
+        reranker_model = f"api:{_api_env('RERANK_API_MODEL') or DEFAULT_RERANK_API_MODEL}"
 
     manifest_payload = load_manifest(manifest_path)
     selected_entries = select_paper_entries(manifest_payload, top_k_papers=args.top_k_papers)
@@ -1892,12 +2075,7 @@ def run_grounding(args: argparse.Namespace) -> dict[str, Any]:
         min_words=args.min_paragraph_words,
     )
 
-    dense_encoder = DenseEncoder(
-        embedding_model,
-        batch_size=args.embedding_batch_size,
-        query_prefix=args.query_prefix,
-        device=args.device,
-    )
+    dense_encoder = build_dense_encoder(args)
     cache_hit = False
     source_counts: dict[str, int] = {}
     cached_corpus = load_cached_corpus(target_dir, corpus_signature)
@@ -1954,16 +2132,12 @@ def run_grounding(args: argparse.Namespace) -> dict[str, Any]:
             refinement_error = str(exc)
             refinement_generator = None
 
-    reranker: ParagraphReranker | None = None
+    reranker: Any = None
     reranker_status = "disabled" if args.disable_reranker else "ok"
     reranker_error: str | None = None
     if not args.disable_reranker:
         try:
-            reranker = ParagraphReranker(
-                reranker_model,
-                batch_size=args.reranker_batch_size,
-                device=args.device,
-            )
+            reranker = build_paragraph_reranker(args)
         except Exception as exc:
             reranker_status = "dense_only_fallback"
             reranker_error = str(exc)

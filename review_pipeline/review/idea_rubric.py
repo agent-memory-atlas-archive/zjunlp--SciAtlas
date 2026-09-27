@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -11,12 +13,9 @@ from pathlib import Path
 from typing import Any
 
 import faiss
-import fitz
 import numpy as np
 import requests
-from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
-from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from cuda_devices import default_torch_device, device_at, first_configured_cuda_devices
 from .common import (
@@ -43,6 +42,14 @@ DEFAULT_NC_META_PATH = "/data1/nc_dataset/merged_nc_dataset/nc_meta.json"
 DEFAULT_SEARCH_TOP_K = 50
 DEFAULT_SEARCH_FINAL_K = 15
 DEFAULT_MAX_WORKERS = 8
+DEFAULT_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+DEFAULT_EMBED_API_MODEL = "BAAI/bge-large-en-v1.5"
+DEFAULT_RERANK_API_MODEL = "BAAI/bge-reranker-v2-m3"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_PRECOMPUTED_ROOT = PROJECT_ROOT / "assets" / "rubric"
+DEFAULT_LOCAL_MODELS_DIR = PROJECT_ROOT / "models"
+LOCAL_EMBED_MODEL_DIRNAME = "bge-large-en-v1.5"
+LOCAL_RERANK_MODEL_DIRNAME = "bge-reranker-large"
 _DEFAULT_CUDA_DEVICES = first_configured_cuda_devices()
 DEFAULT_EMBED_DEVICE = device_at(_DEFAULT_CUDA_DEVICES, 0) or default_torch_device(index=0)
 DEFAULT_RERANK_DEVICE = device_at(_DEFAULT_CUDA_DEVICES, 1) or default_torch_device(index=1)
@@ -185,14 +192,22 @@ class IdeaRubricConfig:
     sources_root: Path | None = None
     env_path: Path | None = None
     llm_api_key: str | None = None
-    llm_base_url: str = DEFAULT_LLM_BASE_URL
-    llm_model_name: str = DEFAULT_LLM_MODEL_NAME
+    llm_base_url: str = ""
+    llm_model_name: str = ""
     llm_temperature: float = DEFAULT_LLM_TEMPERATURE
     llm_timeout_seconds: int = 300
-    embed_model_path: str = DEFAULT_EMBED_MODEL_PATH
-    rerank_model_path: str = DEFAULT_RERANK_MODEL_PATH
-    faiss_index_path: str = DEFAULT_FAISS_INDEX_PATH
-    nc_meta_path: str = DEFAULT_NC_META_PATH
+    embed_model_path: str = ""
+    rerank_model_path: str = ""
+    faiss_index_path: str = ""
+    nc_meta_path: str = ""
+    precomputed_root: str = ""
+    search_mode: str = ""
+    embed_api_base_url: str = ""
+    embed_api_key: str = ""
+    embed_api_model: str = ""
+    rerank_api_base_url: str = ""
+    rerank_api_key: str = ""
+    rerank_api_model: str = ""
     search_top_k: int = DEFAULT_SEARCH_TOP_K
     search_final_k: int = DEFAULT_SEARCH_FINAL_K
     max_workers: int = DEFAULT_MAX_WORKERS
@@ -210,6 +225,17 @@ def _clean_json_response(result_str: str) -> str:
 
 def _compact_text(value: Any) -> str:
     return normalize_whitespace(value)
+
+
+def _env_lookup(env_values: dict[str, str], *names: str) -> str:
+    for name in names:
+        value = normalize_whitespace(os.environ.get(name))
+        if value:
+            return value
+        value = normalize_whitespace(env_values.get(name))
+        if value:
+            return value
+    return ""
 
 
 def _summarize_general_rubric_for_synthesis(general_result: dict[str, Any]) -> str:
@@ -262,6 +288,8 @@ def _summarize_detailed_rubric_for_synthesis(detailed_result: dict[str, Any]) ->
 
 def _extract_pdf_text(pdf_path: Path) -> str:
     try:
+        import fitz
+
         document = fitz.open(pdf_path)
         return "\n".join(page.get_text("text") for page in document)
     except Exception:
@@ -333,6 +361,8 @@ def _fetch_pmc_xml_by_doi(doi: str) -> bytes | None:
 
 
 def _parse_jats_xml_sections(xml_content: bytes) -> dict[str, str]:
+    from bs4 import BeautifulSoup
+
     soup = BeautifulSoup(xml_content, "xml")
     sections = {
         "Abstract": "",
@@ -478,37 +508,159 @@ def _build_canonical_rubric(
     return rubric
 
 
+def _load_faiss_assets(config: IdeaRubricConfig) -> tuple[Any, list[dict[str, Any]]]:
+    index = faiss.read_index(config.faiss_index_path)
+    metadata_store = json.loads(Path(config.nc_meta_path).read_text(encoding="utf-8"))
+    return index, metadata_store
+
+
+def _faiss_recall(
+    index: Any,
+    metadata_store: list[dict[str, Any]],
+    query_vector: Any,
+    idea: str,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    distances, indices = index.search(np.array([np.asarray(query_vector, dtype="float32")]), top_k + 5)
+    retrieved_docs: list[dict[str, Any]] = []
+    idea_lower = idea.strip().lower()
+    for idx_pos, metadata_position in enumerate(indices[0]):
+        if int(metadata_position) < 0:
+            continue
+        doc = dict(metadata_store[int(metadata_position)])
+        title = normalize_whitespace(doc.get("Title"))
+        if title and title.lower() in idea_lower:
+            continue
+        if float(distances[0][idx_pos]) > 0.9:
+            continue
+        retrieved_docs.append(doc)
+        if len(retrieved_docs) >= top_k:
+            break
+    return retrieved_docs
+
+
 class PaperSearchEngine:
     def __init__(self, config: IdeaRubricConfig) -> None:
-        self.index = faiss.read_index(config.faiss_index_path)
-        self.metadata_store = json.loads(Path(config.nc_meta_path).read_text(encoding="utf-8"))
+        from sentence_transformers import CrossEncoder, SentenceTransformer
+
+        self.index, self.metadata_store = _load_faiss_assets(config)
+        self._check_local_model_path(config.embed_model_path, "embedding")
+        self._check_local_model_path(config.rerank_model_path, "reranker")
         self.embed_model = SentenceTransformer(config.embed_model_path, device=config.embed_device)
         self.rerank_model = CrossEncoder(config.rerank_model_path, device=config.rerank_device)
 
+    @staticmethod
+    def _check_local_model_path(model_path: str, kind: str) -> None:
+        candidate = Path(model_path).expanduser()
+        if candidate.exists():
+            return
+        if "/" in model_path and not model_path.startswith("http"):
+            raise FileNotFoundError(
+                f"Local {kind} model not found at {model_path}. Download the models once "
+                "(see the README quickstart): huggingface-cli download BAAI/bge-large-en-v1.5 "
+                "--local-dir <repo>/models/bge-large-en-v1.5 (and BAAI/bge-reranker-large), "
+                "or configure a remote embeddings API via EMBED_API_BASE_URL/EMBED_API_KEY."
+            )
+
     def search(self, idea: str, *, top_k: int, final_k: int) -> list[dict[str, Any]]:
         query_vector = self.embed_model.encode(
-            ["Represent this sentence for searching relevant passages: " + idea],
+            [DEFAULT_QUERY_PREFIX + idea],
             normalize_embeddings=True,
-        )
-        distances, indices = self.index.search(np.array(query_vector).astype("float32"), top_k + 5)
-
-        retrieved_docs: list[dict[str, Any]] = []
-        idea_lower = idea.strip().lower()
-        for idx_pos, index in enumerate(indices[0]):
-            doc = dict(self.metadata_store[index])
-            title = normalize_whitespace(doc.get("Title"))
-            if title and title.lower() in idea_lower:
-                continue
-            if float(distances[0][idx_pos]) > 0.9:
-                continue
-            retrieved_docs.append(doc)
-            if len(retrieved_docs) >= top_k:
-                break
-
+        )[0]
+        retrieved_docs = _faiss_recall(self.index, self.metadata_store, query_vector, idea, top_k)
         cross_inputs = [[idea, doc["doc_text"]] for doc in retrieved_docs]
         rerank_scores = self.rerank_model.predict(cross_inputs, batch_size=16)
         for index, doc in enumerate(retrieved_docs):
             doc["rerank_score"] = float(rerank_scores[index])
+        return sorted(retrieved_docs, key=lambda item: item["rerank_score"], reverse=True)[:final_k]
+
+
+def _join_api_url(base_url: str, suffix: str) -> str:
+    url = base_url.rstrip("/")
+    return url if url.endswith(f"/{suffix}") else f"{url}/{suffix}"
+
+
+class ApiSearchEngine:
+    """FAISS recall with a remote OpenAI-compatible embeddings API plus an optional rerank API.
+
+    The embeddings API must serve the model the FAISS index was built with
+    (bge-large-en-v1.5, 1024 dims). The rerank model is free to vary; when no
+    rerank endpoint is configured, results keep the vector-distance ordering.
+    """
+
+    def __init__(self, config: IdeaRubricConfig) -> None:
+        self.index, self.metadata_store = _load_faiss_assets(config)
+        self.embed_url = _join_api_url(config.embed_api_base_url, "embeddings")
+        self.embed_key = config.embed_api_key or config.llm_api_key or ""
+        self.embed_model = config.embed_api_model or DEFAULT_EMBED_API_MODEL
+        self.rerank_url = (
+            _join_api_url(config.rerank_api_base_url, "rerank") if config.rerank_api_base_url else ""
+        )
+        self.rerank_key = config.rerank_api_key or self.embed_key
+        self.rerank_model = config.rerank_api_model or DEFAULT_RERANK_API_MODEL
+        if not config.embed_api_base_url or not self.embed_key:
+            raise ValueError(
+                "API search mode requires EMBED_API_BASE_URL and an API key (EMBED_API_KEY or the LLM API key)"
+            )
+
+    def _post_json(self, url: str, payload: dict[str, Any], api_key: str, timeout: int) -> dict[str, Any]:
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _embed_query(self, idea: str) -> np.ndarray:
+        data = self._post_json(
+            self.embed_url,
+            {"model": self.embed_model, "input": [DEFAULT_QUERY_PREFIX + idea]},
+            self.embed_key,
+            60,
+        )
+        vector = np.asarray(data["data"][0]["embedding"], dtype="float32")
+        norm = float(np.linalg.norm(vector))
+        if norm > 0:
+            vector = vector / norm
+        return vector
+
+    def _rerank_scores(self, idea: str, retrieved_docs: list[dict[str, Any]]) -> list[float] | None:
+        if not self.rerank_url or not self.rerank_key or not retrieved_docs:
+            return None
+        payload = {
+            "model": self.rerank_model,
+            "query": idea,
+            "documents": [doc["doc_text"] for doc in retrieved_docs],
+            "top_n": len(retrieved_docs),
+        }
+        data = self._post_json(self.rerank_url, payload, self.rerank_key, 120)
+        results = data.get("results") if isinstance(data.get("results"), list) else data.get("data")
+        if not isinstance(results, list):
+            return None
+        scores: dict[int, float] = {}
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            position = item.get("index")
+            score = item.get("relevance_score", item.get("score"))
+            if isinstance(position, int) and score is not None:
+                scores[position] = float(score)
+        return [scores.get(position, 0.0) for position in range(len(retrieved_docs))]
+
+    def search(self, idea: str, *, top_k: int, final_k: int) -> list[dict[str, Any]]:
+        query_vector = self._embed_query(idea)
+        retrieved_docs = _faiss_recall(self.index, self.metadata_store, query_vector, idea, top_k)
+        try:
+            scores = self._rerank_scores(idea, retrieved_docs)
+        except Exception as exc:
+            print(f"[ApiSearchEngine] rerank API failed, falling back to vector order: {exc}", file=sys.stderr)
+            scores = None
+        if scores is None:
+            return retrieved_docs[:final_k]
+        for index, doc in enumerate(retrieved_docs):
+            doc["rerank_score"] = scores[index]
         return sorted(retrieved_docs, key=lambda item: item["rerank_score"], reverse=True)[:final_k]
 
 
@@ -531,31 +683,120 @@ class IdeaRubricRunner:
 
     def _resolve_config(self, config: IdeaRubricConfig) -> IdeaRubricConfig:
         env_values = load_env_values(config.env_path)
+        llm_api_key = first_non_empty(
+            config.llm_api_key,
+            _env_lookup(env_values, "LLM_API_KEY", "DMX-API-KEY", "DMX_API_KEY", "OPENAI_API_KEY"),
+        )
+        embed_api_base_url = first_non_empty(
+            config.embed_api_base_url,
+            _env_lookup(env_values, "EMBED_API_BASE_URL", "EMBED_API_URL"),
+        )
+        embed_api_key = first_non_empty(
+            config.embed_api_key,
+            _env_lookup(env_values, "EMBED_API_KEY"),
+            llm_api_key,
+        )
+        rerank_api_base_url = first_non_empty(
+            config.rerank_api_base_url,
+            _env_lookup(env_values, "RERANK_API_BASE_URL", "RERANK_API_URL"),
+        )
+        rerank_api_key = first_non_empty(
+            config.rerank_api_key,
+            _env_lookup(env_values, "RERANK_API_KEY"),
+            embed_api_key,
+        )
+        search_mode = (
+            normalize_whitespace(config.search_mode)
+            or _env_lookup(env_values, "SCIATLAS_SEARCH_MODE", "RUBRIC_SEARCH_MODE")
+            or "auto"
+        ).lower()
+        if search_mode not in {"auto", "local", "api"}:
+            search_mode = "auto"
+        if search_mode == "auto":
+            search_mode = "api" if embed_api_base_url and embed_api_key else "local"
+        precomputed_root = first_non_empty(
+            config.precomputed_root,
+            _env_lookup(env_values, "RUBRIC_PRECOMPUTED_ROOT"),
+        )
+        if not precomputed_root and (DEFAULT_PRECOMPUTED_ROOT / "papers").is_dir():
+            precomputed_root = str(DEFAULT_PRECOMPUTED_ROOT)
+        faiss_index_path = first_non_empty(
+            config.faiss_index_path,
+            _env_lookup(env_values, "RUBRIC_FAISS_INDEX_PATH"),
+            DEFAULT_FAISS_INDEX_PATH,
+        )
+        nc_meta_path = first_non_empty(
+            config.nc_meta_path,
+            _env_lookup(env_values, "RUBRIC_NC_META_PATH"),
+            DEFAULT_NC_META_PATH,
+        )
+        if precomputed_root:
+            # The asset pack bundles the FAISS index and nc_meta.json; prefer them
+            # when the configured locations do not exist on this machine.
+            packed_index = Path(precomputed_root).expanduser() / "faiss_nc.index"
+            if not Path(faiss_index_path).expanduser().exists() and packed_index.is_file():
+                faiss_index_path = str(packed_index)
+            packed_meta = Path(precomputed_root).expanduser() / "nc_meta.json"
+            if not Path(nc_meta_path).expanduser().exists() and packed_meta.is_file():
+                nc_meta_path = str(packed_meta)
+        embed_model_path = first_non_empty(
+            config.embed_model_path,
+            _env_lookup(env_values, "RUBRIC_EMBED_MODEL_PATH", "INNOEVAL_EMBEDDING_MODEL_PATH"),
+            DEFAULT_EMBED_MODEL_PATH,
+        )
+        if not Path(embed_model_path).expanduser().exists():
+            # Fall back to models downloaded into <repo>/models/ (see README quickstart).
+            repo_embed_model = DEFAULT_LOCAL_MODELS_DIR / LOCAL_EMBED_MODEL_DIRNAME
+            if repo_embed_model.is_dir():
+                embed_model_path = str(repo_embed_model)
+        rerank_model_path = first_non_empty(
+            config.rerank_model_path,
+            _env_lookup(env_values, "RUBRIC_RERANK_MODEL_PATH", "INNOEVAL_RERANKER_MODEL_PATH"),
+            DEFAULT_RERANK_MODEL_PATH,
+        )
+        if not Path(rerank_model_path).expanduser().exists():
+            repo_rerank_model = DEFAULT_LOCAL_MODELS_DIR / LOCAL_RERANK_MODEL_DIRNAME
+            if repo_rerank_model.is_dir():
+                rerank_model_path = str(repo_rerank_model)
         return IdeaRubricConfig(
             target_idea=normalize_whitespace(config.target_idea),
             artifact_root=Path(config.artifact_root).expanduser().resolve(),
             output_path=Path(config.output_path).expanduser().resolve(),
             sources_root=Path(config.sources_root).expanduser().resolve() if config.sources_root else None,
             env_path=Path(config.env_path).expanduser().resolve() if config.env_path else None,
-            llm_api_key=first_non_empty(
-                config.llm_api_key,
-                env_values.get("DMX-API-KEY"),
-                env_values.get("DMX_API_KEY"),
-                env_values.get("OPENAI_API_KEY"),
-            )
-            or None,
+            llm_api_key=llm_api_key or None,
             llm_base_url=first_non_empty(
                 config.llm_base_url,
-                env_values.get("OPENAI_BASE_URL"),
+                _env_lookup(env_values, "LLM_BASE_URL", "OPENAI_BASE_URL"),
                 DEFAULT_LLM_BASE_URL,
             ),
-            llm_model_name=first_non_empty(config.llm_model_name, DEFAULT_LLM_MODEL_NAME),
+            llm_model_name=first_non_empty(
+                config.llm_model_name,
+                _env_lookup(env_values, "LLM_MODEL", "OPENAI_MODEL"),
+                DEFAULT_LLM_MODEL_NAME,
+            ),
             llm_temperature=float(config.llm_temperature),
             llm_timeout_seconds=int(config.llm_timeout_seconds),
-            embed_model_path=first_non_empty(config.embed_model_path, DEFAULT_EMBED_MODEL_PATH),
-            rerank_model_path=first_non_empty(config.rerank_model_path, DEFAULT_RERANK_MODEL_PATH),
-            faiss_index_path=first_non_empty(config.faiss_index_path, DEFAULT_FAISS_INDEX_PATH),
-            nc_meta_path=first_non_empty(config.nc_meta_path, DEFAULT_NC_META_PATH),
+            embed_model_path=embed_model_path,
+            rerank_model_path=rerank_model_path,
+            faiss_index_path=faiss_index_path,
+            nc_meta_path=nc_meta_path,
+            precomputed_root=precomputed_root,
+            search_mode=search_mode,
+            embed_api_base_url=embed_api_base_url,
+            embed_api_key=embed_api_key,
+            embed_api_model=first_non_empty(
+                config.embed_api_model,
+                _env_lookup(env_values, "EMBED_API_MODEL"),
+                DEFAULT_EMBED_API_MODEL,
+            ),
+            rerank_api_base_url=rerank_api_base_url,
+            rerank_api_key=rerank_api_key,
+            rerank_api_model=first_non_empty(
+                config.rerank_api_model,
+                _env_lookup(env_values, "RERANK_API_MODEL"),
+                DEFAULT_RERANK_API_MODEL,
+            ),
             search_top_k=int(config.search_top_k),
             search_final_k=int(config.search_final_k),
             max_workers=int(config.max_workers),
@@ -599,12 +840,36 @@ class IdeaRubricRunner:
         title = normalize_whitespace(doc.get("Title")) or normalize_whitespace(doc.get("title")) or f"paper-{index}"
         return ensure_directory(self.sources_root / "papers" / f"{index:02d}_{slugify(title, limit=60)}")
 
+    def _precomputed_paper_dir(self, folder_name: Any) -> Path | None:
+        root = normalize_whitespace(self.config.precomputed_root)
+        name = normalize_whitespace(folder_name)
+        if not root or not name:
+            return None
+        candidate = Path(root).expanduser() / "papers" / name
+        return candidate if candidate.is_dir() else None
+
+    def _seed_from_precomputed(self, precomputed_dir: Path | None, filename: str, target_path: Path) -> bool:
+        if target_path.exists():
+            return True
+        if precomputed_dir is None:
+            return False
+        source_path = precomputed_dir / filename
+        if not source_path.is_file():
+            return False
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_path, target_path)
+        return True
+
     def process_single_retrieved_paper_sources(self, doc: dict[str, Any]) -> dict[str, Any]:
         paper_started_at = time.perf_counter()
         source_folder = Path(normalize_whitespace(doc.get("source_folder_path") or doc.get("folder_path")))
         artifact_dir = Path(doc["artifact_dir"])
         title = normalize_whitespace(doc.get("Title"))
         doi = normalize_whitespace(doc.get("DOI"))
+        folder_name = normalize_whitespace(doc.get("folder_name")) or (
+            source_folder.name if normalize_whitespace(doc.get("source_folder_path") or doc.get("folder_path")) else ""
+        )
+        precomputed_dir = self._precomputed_paper_dir(folder_name)
         timings_ms: dict[str, Any] = {}
 
         def finish(status: str, reason: str | None = None) -> dict[str, Any]:
@@ -628,37 +893,56 @@ class IdeaRubricRunner:
             )
             return payload
 
-        if not source_folder.exists():
-            return finish("skipped", "source folder does not exist")
+        if not source_folder.exists() and precomputed_dir is None:
+            return finish("skipped", "source folder does not exist and no precomputed assets")
 
         sections_path = artifact_dir / "extracted_sections.json"
         review_text_path = artifact_dir / "review_text.txt"
         source_meta_path = artifact_dir / "source_meta.json"
-
-        if not sections_path.exists():
-            step_started_at = time.perf_counter()
-            xml_content = _fetch_pmc_xml_by_doi(doi)
-            if not xml_content:
-                timings_ms["sections"] = round((time.perf_counter() - step_started_at) * 1000, 1)
-                return finish("skipped", "PMC XML unavailable")
-            sections = _parse_jats_xml_sections(xml_content)
-            if not any(sections.values()):
-                timings_ms["sections"] = round((time.perf_counter() - step_started_at) * 1000, 1)
-                return finish("skipped", "no parsed sections")
-            write_json(sections_path, sections)
-            timings_ms["sections"] = round((time.perf_counter() - step_started_at) * 1000, 1)
+        fully_precomputed = precomputed_dir is not None and (
+            (precomputed_dir / "summary.json").is_file() and (precomputed_dir / "dimensions.json").is_file()
+        )
 
         if not review_text_path.exists():
             step_started_at = time.perf_counter()
-            review_pdf_path = next(source_folder.glob("review*.pdf"), None)
-            if review_pdf_path is None:
-                return finish("skipped", "review PDF missing")
-            peer_raw_text = _extract_pdf_text(review_pdf_path)
-            if not peer_raw_text:
-                return finish("skipped", "review PDF text extraction failed")
-            clean_review = _filter_review_report(peer_raw_text)
-            _write_text(review_text_path, clean_review)
-            timings_ms["review_text"] = round((time.perf_counter() - step_started_at) * 1000, 1)
+            seeded = self._seed_from_precomputed(precomputed_dir, "review_text.txt", review_text_path)
+            if seeded:
+                timings_ms["review_text"] = round((time.perf_counter() - step_started_at) * 1000, 1)
+                timings_ms["review_text_source"] = "precomputed"
+            else:
+                review_pdf_path = next(source_folder.glob("review*.pdf"), None)
+                peer_raw_text = _extract_pdf_text(review_pdf_path) if review_pdf_path is not None else ""
+                if not peer_raw_text:
+                    if not fully_precomputed:
+                        return finish(
+                            "skipped",
+                            "review PDF missing" if review_pdf_path is None else "review PDF text extraction failed",
+                        )
+                else:
+                    clean_review = _filter_review_report(peer_raw_text)
+                    _write_text(review_text_path, clean_review)
+                    timings_ms["review_text"] = round((time.perf_counter() - step_started_at) * 1000, 1)
+
+        if not sections_path.exists():
+            step_started_at = time.perf_counter()
+            seeded = self._seed_from_precomputed(precomputed_dir, "extracted_sections.json", sections_path)
+            if seeded:
+                timings_ms["sections"] = round((time.perf_counter() - step_started_at) * 1000, 1)
+                timings_ms["sections_source"] = "precomputed"
+            elif fully_precomputed:
+                # The LLM stage seeds summary/dimensions directly; raw sections are not needed.
+                timings_ms["sections_source"] = "skipped_precomputed_llm_artifacts"
+            else:
+                xml_content = _fetch_pmc_xml_by_doi(doi)
+                if not xml_content:
+                    timings_ms["sections"] = round((time.perf_counter() - step_started_at) * 1000, 1)
+                    return finish("skipped", "PMC XML unavailable")
+                sections = _parse_jats_xml_sections(xml_content)
+                if not any(sections.values()):
+                    timings_ms["sections"] = round((time.perf_counter() - step_started_at) * 1000, 1)
+                    return finish("skipped", "no parsed sections")
+                write_json(sections_path, sections)
+                timings_ms["sections"] = round((time.perf_counter() - step_started_at) * 1000, 1)
 
         if not source_meta_path.exists():
             write_json(
@@ -666,6 +950,8 @@ class IdeaRubricRunner:
                 {
                     "title": title,
                     "doi": doi,
+                    "folder_name": folder_name,
+                    "precomputed_dir": str(precomputed_dir.resolve()) if precomputed_dir else None,
                     "source_folder_path": str(source_folder.resolve()),
                     "artifact_dir": str(artifact_dir.resolve()),
                 },
@@ -704,6 +990,15 @@ class IdeaRubricRunner:
         review_text_path = Path(normalize_whitespace(doc.get("review_text_path"))) if normalize_whitespace(doc.get("review_text_path")) else artifact_dir / "review_text.txt"
         summary_path = artifact_dir / "summary.json"
         dimensions_path = artifact_dir / "dimensions.json"
+
+        precomputed_dir = self._precomputed_paper_dir(doc.get("folder_name"))
+        summary_seeded = self._seed_from_precomputed(precomputed_dir, "summary.json", summary_path)
+        dimensions_seeded = self._seed_from_precomputed(precomputed_dir, "dimensions.json", dimensions_path)
+        if summary_path.exists() and dimensions_path.exists():
+            if summary_seeded and dimensions_seeded:
+                timings_ms["precomputed_seeded"] = True
+                return finish("ok", "precomputed summary and dimensions seeded")
+            return finish("ok")
 
         if not sections_path.exists():
             return finish("skipped", "sections file missing")
@@ -825,7 +1120,14 @@ class IdeaRubricRunner:
 
     def build_sources(self) -> dict[str, Any]:
         ensure_directory(self.sources_root)
-        engine = PaperSearchEngine(self.config)
+        self._log_timing(
+            "search_engine",
+            mode=self.config.search_mode,
+            precomputed_root=self.config.precomputed_root or None,
+            embed_api_model=self.config.embed_api_model if self.config.search_mode == "api" else None,
+            rerank_api=self.config.rerank_api_base_url or None,
+        )
+        engine = ApiSearchEngine(self.config) if self.config.search_mode == "api" else PaperSearchEngine(self.config)
         retrieved_docs = engine.search(
             self.config.target_idea,
             top_k=self.config.search_top_k,
@@ -836,6 +1138,7 @@ class IdeaRubricRunner:
 
         for index, doc in enumerate(retrieved_docs, start=1):
             doc["source_folder_path"] = normalize_whitespace(doc.get("folder_path"))
+            doc["folder_name"] = Path(doc["source_folder_path"]).name if doc["source_folder_path"] else ""
             doc["artifact_dir"] = str(self._build_doc_artifact_dir(index, doc).resolve())
 
         retrieved_papers_path = self.sources_root / "retrieved_papers.json"
@@ -858,6 +1161,7 @@ class IdeaRubricRunner:
                     {
                         "title": normalize_whitespace(doc.get("Title")),
                         "doi": normalize_whitespace(doc.get("DOI")),
+                        "folder_name": normalize_whitespace(doc.get("folder_name")),
                         "artifact_dir": doc["artifact_dir"],
                         "sections_path": str((Path(doc["artifact_dir"]) / "extracted_sections.json").resolve()),
                         "review_text_path": str((Path(doc["artifact_dir"]) / "review_text.txt").resolve()),
@@ -900,6 +1204,7 @@ class IdeaRubricRunner:
                 {
                     "Title": title,
                     "DOI": normalize_whitespace(item.get("doi")),
+                    "folder_name": normalize_whitespace(item.get("folder_name")),
                     "artifact_dir": str(
                         ensure_directory(self.config.artifact_root / "papers" / source_artifact_dir.name).resolve()
                     ),
@@ -917,7 +1222,10 @@ class IdeaRubricRunner:
         processing_index_path = self.config.artifact_root / "processing_index.json"
         write_json(processing_index_path, {"papers": processing_results})
 
-        historical_context = self.extract_criteria_context(retrieved_docs)
+        # dimensions.json lives under the llm-stage artifact dirs (llm_docs), not the
+        # sources-stage dirs carried in paper_contexts.json; reading the latter silently
+        # produced an empty "No data." historical context in split-worker runs.
+        historical_context = self.extract_criteria_context(llm_docs)
         historical_context_path = self.config.artifact_root / "historical_context.txt"
         _write_text(historical_context_path, historical_context)
         general_user_content = (
