@@ -1852,7 +1852,7 @@ def _missing_or_placeholder(value: str | None) -> bool:
     } or any(token in normalized for token in placeholder_tokens)
 
 
-def _chat_completions_url(base_url: str, full_url: str = "") -> str:
+def _chat_completions_url_from_parts(base_url: str, full_url: str = "") -> str:
     url = (full_url or "").strip()
     if url:
         return url
@@ -1901,7 +1901,7 @@ def _optional_llm_config() -> dict[str, Any] | None:
     auth_header = _env_first("LLM_AUTH_HEADER", "SCIATLAS_LLM_AUTH_HEADER")
     extra_headers = _env_first("LLM_HTTP_HEADERS", "SCIATLAS_LLM_HTTP_HEADERS")
     model = _env_first("LLM_MODEL", "SCIATLAS_LLM_MODEL", "OPENAI_MODEL")
-    endpoint = _chat_completions_url(base_url, full_url)
+    endpoint = _chat_completions_url_from_parts(base_url, full_url)
     if _missing_or_placeholder(endpoint) or _missing_or_placeholder(model):
         return None
     headers = _parse_llm_extra_headers(extra_headers)
