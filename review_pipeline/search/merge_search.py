@@ -1273,14 +1273,36 @@ class DmxPaperBatchScorer:
         if not api_key:
             raise ValueError("LLM API key not found in env file or environment")
         self.api_key = api_key
-        self.api_url = first_non_empty(
+        api_url = first_non_empty(
             env_values.get("SEARCH_LLM_API_URL"),
+            env_values.get("LLM_CHAT_COMPLETIONS_URL"),
             env_values.get("LLM_API_URL"),
+            env_values.get("OPENAI_CHAT_COMPLETIONS_URL"),
             os.environ.get("SEARCH_LLM_API_URL"),
+            os.environ.get("LLM_CHAT_COMPLETIONS_URL"),
             os.environ.get("LLM_API_URL"),
-            DMX_API_URL,
+            os.environ.get("OPENAI_CHAT_COMPLETIONS_URL"),
         )
-        self.model = model
+        if not api_url:
+            base_url = first_non_empty(
+                env_values.get("LLM_BASE_URL"),
+                env_values.get("OPENAI_BASE_URL"),
+                os.environ.get("LLM_BASE_URL"),
+                os.environ.get("OPENAI_BASE_URL"),
+            ).rstrip("/")
+            if base_url:
+                api_url = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
+        self.api_url = api_url or DMX_API_URL
+        self.model = first_non_empty(
+            "" if model == DEFAULT_DMX_MODEL else model,
+            env_values.get("SEARCH_LLM_MODEL"),
+            env_values.get("LLM_MODEL"),
+            env_values.get("OPENAI_MODEL"),
+            os.environ.get("SEARCH_LLM_MODEL"),
+            os.environ.get("LLM_MODEL"),
+            os.environ.get("OPENAI_MODEL"),
+            DEFAULT_DMX_MODEL,
+        )
         self.timeout = timeout
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -1529,7 +1551,7 @@ def score_unique_papers_with_llm(
     return {
         "status": status,
         "strategy": "dmx_batch_mean",
-        "model": getattr(args, "llm_model", DEFAULT_DMX_MODEL),
+        "model": scorer.model,
         "batch_size": max(2, int(getattr(args, "llm_batch_size", DEFAULT_LLM_BATCH_SIZE))),
         "paper_coverage": 1
         if len(unique_papers) <= max(2, int(getattr(args, "llm_batch_size", DEFAULT_LLM_BATCH_SIZE)))

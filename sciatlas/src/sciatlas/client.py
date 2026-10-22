@@ -23,6 +23,23 @@ class SciAtlasClient:
     def _url(self, endpoint: str) -> str:
         return self.config.base_url.rstrip("/") + "/" + endpoint.lstrip("/")
 
+    @staticmethod
+    def _raise_for_envelope_status(body: Any, endpoint: str) -> None:
+        """KG2API Search API v1.0.0 envelope: ``status != "ok"`` is a server error."""
+        if not isinstance(body, dict):
+            return
+        status = body.get("status")
+        if status is None or str(status).lower() == "ok":
+            return
+        message = body.get("error") or body.get("message") or body.get("detail")
+        if isinstance(message, (dict, list)):
+            message = json.dumps(message, ensure_ascii=False)
+        prefix = f"SciAtlas API returned status={status!r} for {endpoint}"
+        request_id = body.get("request_id")
+        if request_id:
+            prefix += f" (request_id={request_id})"
+        raise RuntimeError(f"{prefix}: {message or 'no error message provided'}")
+
     def request(self, method: str, endpoint: str, payload: dict[str, Any] | None = None) -> Any:
         headers = {"Accept": "application/json"}
         data = None
@@ -47,7 +64,7 @@ class SciAtlasClient:
         try:
             with urllib.request.urlopen(req, timeout=self.config.timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
-                return json.loads(raw) if raw else None
+                body = json.loads(raw) if raw else None
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
             try:
@@ -55,6 +72,10 @@ class SciAtlasClient:
             except json.JSONDecodeError:
                 detail = raw
             raise RuntimeError(f"SciAtlas API error {exc.code}: {detail}") from exc
+
+        if endpoint.rstrip("/") != "/healthz":
+            self._raise_for_envelope_status(body, endpoint)
+        return body
 
     def health(self) -> Any:
         return self.request("GET", "/healthz")

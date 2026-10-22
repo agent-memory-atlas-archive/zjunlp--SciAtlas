@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Standalone academic search seed extraction service backed by DMX API."""
+"""Standalone academic search seed extraction service backed by an OpenAI-compatible chat API."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -74,21 +75,67 @@ class KeywordExtractorConfig:
     use_env_proxy: bool = False
 
 
-def load_api_key(env_path: Path) -> str:
-    if not env_path.exists():
-        raise FileNotFoundError(f".env not found: {env_path}")
+API_KEY_ALIASES = ("DMX-API-KEY", "DMX_API_KEY", "LLM_API_KEY", "OPENAI_API_KEY")
+_API_URL_ENV_NAMES = (
+    "SEARCH_LLM_API_URL",
+    "LLM_CHAT_COMPLETIONS_URL",
+    "LLM_API_URL",
+    "OPENAI_CHAT_COMPLETIONS_URL",
+)
+_BASE_URL_ENV_NAMES = ("LLM_BASE_URL", "OPENAI_BASE_URL")
+_MODEL_ENV_NAMES = ("SEARCH_LLM_MODEL", "LLM_MODEL", "OPENAI_MODEL")
 
+
+def _load_env_file_values(env_path: Path) -> dict[str, str]:
+    if not env_path.exists():
+        return {}
+    values: dict[str, str] = {}
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        if key.strip() == "DMX-API-KEY":
-            api_key = value.strip().strip('"').strip("'")
-            if api_key:
-                return api_key
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
 
-    raise ValueError("DMX-API-KEY not found in .env")
+
+def _lookup_env(env_values: dict[str, str], *names: str) -> str:
+    for name in names:
+        value = os.environ.get(name, "").strip() or env_values.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def load_api_key(env_path: Path) -> str:
+    env_values = _load_env_file_values(env_path)
+    api_key = _lookup_env(env_values, *API_KEY_ALIASES)
+    if api_key:
+        return api_key
+    raise ValueError(
+        f"No LLM API key found in the environment or {env_path}. "
+        "Set LLM_API_KEY (preferred), OPENAI_API_KEY or DMX-API-KEY (legacy)."
+    )
+
+
+def resolve_api_url(env_path: Path, configured: str) -> str:
+    if configured and configured != API_URL:
+        return configured
+    env_values = _load_env_file_values(env_path)
+    explicit = _lookup_env(env_values, *_API_URL_ENV_NAMES)
+    if explicit:
+        return explicit
+    base_url = _lookup_env(env_values, *_BASE_URL_ENV_NAMES).rstrip("/")
+    if base_url:
+        return base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
+    return configured
+
+
+def resolve_model(env_path: Path, configured: str) -> str:
+    if configured and configured != DEFAULT_MODEL:
+        return configured
+    env_values = _load_env_file_values(env_path)
+    return _lookup_env(env_values, *_MODEL_ENV_NAMES) or configured
 
 
 def strip_code_fence(text: str) -> str:
@@ -141,6 +188,8 @@ class KeywordExtractor:
     def __init__(self, config: KeywordExtractorConfig | None = None) -> None:
         self.config = config or KeywordExtractorConfig()
         self.api_key = load_api_key(self.config.env_path)
+        self.api_url = resolve_api_url(self.config.env_path, self.config.api_url)
+        self.model = resolve_model(self.config.env_path, self.config.model)
         self.opener = self._build_opener()
 
     def _build_opener(self) -> urllib.request.OpenerDirector:
@@ -154,7 +203,7 @@ class KeywordExtractor:
             raise ValueError("input_text must not be empty")
 
         payload = {
-            "model": self.config.model,
+            "model": self.model,
             "messages": [
                 {
                     "role": "system",
@@ -167,7 +216,7 @@ class KeywordExtractor:
         }
 
         request = urllib.request.Request(
-            self.config.api_url,
+            self.api_url,
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",

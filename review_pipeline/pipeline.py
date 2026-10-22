@@ -175,11 +175,6 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
         action="store_true",
         help="Skip LLM refinement for final paragraph grounding matches.",
     )
-    parser.add_argument(
-        "--grounding-device",
-        default=None,
-        help="Deprecated. Use --cuda-devices; kept as a compatibility alias.",
-    )
     parser.add_argument("--disable-llm-ranking", action="store_true", help="Skip search-stage LLM reranking.")
 
     parser.add_argument("--disable-reviewers", action="store_true", help="Skip reviewer background branch.")
@@ -214,11 +209,6 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
         help="Subject persona group merged with general for reviewer persona sampling.",
     )
     parser.add_argument(
-        "--rubric-gpu-devices",
-        default=None,
-        help="Deprecated. Use --cuda-devices; kept as a compatibility alias.",
-    )
-    parser.add_argument(
         "--rubric-search-top-k",
         type=int,
         default=None,
@@ -241,25 +231,6 @@ def build_parser(defaults: dict[str, Any] | None = None) -> argparse.ArgumentPar
         type=int,
         default=300,
         help="Per-call timeout for rubric LLM requests.",
-    )
-    parser.add_argument(
-        "--rubric-search-mode",
-        default=None,
-        choices=["auto", "local", "api"],
-        help=(
-            "Rubric paper retrieval backend: 'local' loads sentence-transformers models, "
-            "'api' uses a remote OpenAI-compatible embeddings endpoint (EMBED_API_*), "
-            "'auto' picks api when EMBED_API_BASE_URL is configured."
-        ),
-    )
-    parser.add_argument(
-        "--rubric-precomputed-root",
-        default=None,
-        help=(
-            "Root of the precomputed rubric asset pack containing papers/<folder_name>/"
-            "{summary.json,dimensions.json,review_text.txt,extracted_sections.json}. "
-            "Defaults to <repo>/assets/rubric when present."
-        ),
     )
     parser.add_argument("--disable-review-stage", action="store_true", help="Skip reviewer evaluation stage.")
     parser.add_argument("--disable-report-stage", action="store_true", help="Skip report synthesis stage.")
@@ -443,9 +414,7 @@ def resolve_pipeline_cuda_devices(args: argparse.Namespace) -> list[str]:
     return unique_cuda_devices(
         [
             args.cuda_devices,
-            args.grounding_device,
             args.reviewer_gpu_devices,
-            args.rubric_gpu_devices,
             os.environ.get("INNOEVAL_CUDA_DEVICES"),
             os.environ.get("CUDA_DEVICES"),
         ]
@@ -2290,7 +2259,6 @@ def launch_reviewer_inline(
     device: str | None = None,
     cuda_devices: list[str] | None = None,
 ) -> dict[str, Any]:
-    from review.author_background import AuthorBackgroundConfig, run_author_background
     from review.persona import DEFAULT_PERSONA_SUBJECT, select_random_persona
 
     input_path = work_dir / "input.json"
@@ -2360,6 +2328,8 @@ def launch_reviewer_inline(
             target_author = author_id if search_method == "id" and author_id else (author_name or author_id)
             if not target_author:
                 raise ValueError("Worker payload must contain author_name or author_id")
+
+            from review.author_background import AuthorBackgroundConfig, run_author_background
 
             config = AuthorBackgroundConfig(
                 target_author=target_author,
@@ -2504,18 +2474,16 @@ def run_grounding_stage(
     idea_context_path: Path,
     manifest_path: Path,
     output_dir: Path,
-    cuda_devices: list[str],
     loggers: list[logging.LoggerAdapter],
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     result_path = output_dir / "result.json"
-    grounding_device = device_at(cuda_devices, 0)
     log_to_many(
         loggers,
         "info",
         (
             f"Starting grounding stage manifest={manifest_path.resolve()} output_dir={output_dir} "
-            f"device={grounding_device or ''} smoke={args.smoke}"
+            f"smoke={args.smoke}"
         ),
     )
     with capture_stage_output(loggers, stage_name="grounding"):
@@ -2545,8 +2513,6 @@ def run_grounding_stage(
                 "--output",
                 str(result_path.resolve()),
             ]
-            if grounding_device:
-                cli_args.extend(["--device", grounding_device])
             if not args.disable_grounding_refinement:
                 cli_args.append("--enable-grounding-refinement")
             cli_args.extend(["--idea-context", str(idea_context_path.resolve())])
@@ -3008,6 +2974,9 @@ def main(argv: list[str] | None = None) -> int:
     final_output_path = run_dir / "result.json"
 
     try:
+        # ============================================================
+        # Stage 1: Idea Context - 想法上下文提取
+        # ============================================================
         idea_context_cache_keys = ["smoke"]
         idea_context_cache_allowed = cache_allowed(
             args=args,
@@ -3063,6 +3032,9 @@ def main(argv: list[str] | None = None) -> int:
         if idea_context_stage.get("cache_source_run_dir"):
             stage_payloads["idea_context"]["cache_source_run_dir"] = idea_context_stage["cache_source_run_dir"]
 
+        # ============================================================
+        # Stage 2: Search - 检索相关论文
+        # ============================================================
         search_cache_keys = ["smoke", "kg_top_k", "s2_top_k", "disable_llm_ranking"]
         search_cache_allowed = cache_allowed(
             args=args,
@@ -3113,6 +3085,9 @@ def main(argv: list[str] | None = None) -> int:
         if search_stage.get("cache_source_run_dir"):
             stage_payloads["search"]["cache_source_run_dir"] = search_stage["cache_source_run_dir"]
 
+        # ============================================================
+        # Stage 5a: Reviewers - 评审者背景生成（并行分支）
+        # ============================================================
         selection_path = reviewers_output_dir / "selection.json"
         reviewer_own_cache_keys = [
             "smoke",
@@ -3179,14 +3154,15 @@ def main(argv: list[str] | None = None) -> int:
         device_pool = cuda_devices
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(args.reviewer_max_workers, 1))
         try:
+            # ============================================================
+            # Stage 5b: Rubric Sources - 评审标准来源提取（并行分支）
+            # ============================================================
             if not args.disable_rubric and evaluation_target_text:
                 rubric_sources_own_cache_keys = [
                     "smoke",
                     "disable_rubric",
                     "rubric_search_top_k",
                     "rubric_search_final_k",
-                    "rubric_search_mode",
-                    "rubric_precomputed_root",
                 ]
                 rubric_sources_cache_keys = cache_key_union(idea_context_cache_keys, rubric_sources_own_cache_keys)
                 rubric_sources_cache_allowed = cache_allowed(
@@ -3230,14 +3206,6 @@ def main(argv: list[str] | None = None) -> int:
                         "search_final_k": args.rubric_search_final_k,
                         "max_workers": args.rubric_max_workers,
                         "llm_timeout_seconds": args.rubric_llm_timeout_seconds,
-                        "search_mode": args.rubric_search_mode or "",
-                        "precomputed_root": (
-                            str(Path(args.rubric_precomputed_root).expanduser().resolve())
-                            if args.rubric_precomputed_root
-                            else ""
-                        ),
-                        "embed_device": device_at(cuda_devices, 0),
-                        "rerank_device": device_at(cuda_devices, 1) or device_at(cuda_devices, 0),
                     }
                     rubric_sources_future = executor.submit(
                         launch_worker,
@@ -3332,6 +3300,9 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                 )
 
+            # ============================================================
+            # Stage 3: Manifest - 下载并解析论文 PDF
+            # ============================================================
             manifest_own_cache_keys = ["smoke", "manifest_top_k"]
             manifest_cache_keys = cache_key_union(search_cache_keys, manifest_own_cache_keys)
             manifest_cache_allowed = cache_allowed(
@@ -3380,6 +3351,9 @@ def main(argv: list[str] | None = None) -> int:
             if manifest_stage.get("cache_source_run_dir"):
                 stage_payloads["manifest"]["cache_source_run_dir"] = manifest_stage["cache_source_run_dir"]
 
+            # ============================================================
+            # Stage 4: Grounding - 证据落地（段落级匹配）
+            # ============================================================
             grounding_own_cache_keys = ["smoke", "grounding_final_top_k", "disable_grounding_refinement"]
             grounding_cache_keys = cache_key_union(manifest_cache_keys, grounding_own_cache_keys)
             grounding_cache_allowed = cache_allowed(
@@ -3418,7 +3392,6 @@ def main(argv: list[str] | None = None) -> int:
                     idea_context_path=idea_context_path,
                     manifest_path=Path(manifest_stage["manifest_path"]),
                     output_dir=grounding_output_dir,
-                    cuda_devices=cuda_devices,
                     loggers=[pipeline_logger, grounding_logger],
                 )
             stage_payloads["grounding"] = {
@@ -3472,6 +3445,9 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     stage_payloads["rubric_sources"] = {"status": "skipped"}
 
+            # ============================================================
+            # Stage 5c: Rubric LLM - 评审标准生成（并行分支）
+            # ============================================================
             if not args.disable_rubric and evaluation_target_text and stage_payloads["rubric_sources"].get("status") == "ok":
                 rubric_llm_own_cache_keys = [
                     "smoke",
@@ -3519,11 +3495,6 @@ def main(argv: list[str] | None = None) -> int:
                         "env_path": str(Path(args.env).expanduser().resolve()),
                         "max_workers": args.rubric_max_workers,
                         "llm_timeout_seconds": args.rubric_llm_timeout_seconds,
-                        "precomputed_root": (
-                            str(Path(args.rubric_precomputed_root).expanduser().resolve())
-                            if args.rubric_precomputed_root
-                            else ""
-                        ),
                     }
                     rubric_llm_future = executor.submit(
                         launch_worker,
@@ -3580,6 +3551,9 @@ def main(argv: list[str] | None = None) -> int:
             "report_dir": str(report_output_dir.resolve()),
         }
 
+        # ============================================================
+        # Stage 6: Review - 使用评审者和 rubric 进行评审
+        # ============================================================
         review_own_cache_keys = [
             "smoke",
             "disable_review_stage",
@@ -3657,6 +3631,9 @@ def main(argv: list[str] | None = None) -> int:
             "evidence_bank_path": stage_payloads.get("review", {}).get("evidence_bank_path"),
         }
 
+        # ============================================================
+        # Stage 7: Report - 生成最终评审报告
+        # ============================================================
         report_own_cache_keys = [
             "smoke",
             "disable_report_stage",

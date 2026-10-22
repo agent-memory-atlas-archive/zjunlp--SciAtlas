@@ -7,15 +7,12 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
-import os
+import math
 import re
-import requests
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-import numpy as np
 
 from ..llm import resolve_llm_settings
 from ..llm.client import build_llm_client
@@ -26,56 +23,36 @@ DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 DEFAULT_MANIFEST_PATH = PROJECT_ROOT / "runs" / "pdf_manifest" / "manifest.json"
 DEFAULT_TARGET_DIR = Path("/tmp/sciatlas_grounding/target")
 DEFAULT_RESULT_DIR = Path("/tmp/sciatlas_grounding/result")
-_LOCAL_MODELS_DIR = PROJECT_ROOT / "models"
+DEFAULT_RERANKER_LLM_BATCH = 8
+RERANKER_LLM_PARAGRAPH_MAX_CHARS = 1200
+_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 
-
-def _resolve_local_model(dirname: str, hf_repo_id: str) -> str:
-    candidate = _LOCAL_MODELS_DIR / dirname
-    return str(candidate) if candidate.is_dir() else hf_repo_id
-
-
-DEFAULT_EMBEDDING_MODEL = (
-    os.getenv("SCIATLAS_EMBEDDING_MODEL_PATH")
-    or os.getenv("INNOEVAL_EMBEDDING_MODEL_PATH")
-    or _resolve_local_model("bge-large-en-v1.5", "BAAI/bge-large-en-v1.5")
+RERANKER_LLM_SYSTEM_PROMPT = (
+    "You are a scientific relevance scoring agent. "
+    "Given a research-focused query and a numbered list of paper paragraphs, score how relevant each "
+    "paragraph is to the query on a 0-10 scale. Return strict JSON only."
 )
-DEFAULT_RERANKER_MODEL = (
-    os.getenv("SCIATLAS_RERANKER_MODEL_PATH")
-    or os.getenv("INNOEVAL_RERANKER_MODEL_PATH")
-    or _resolve_local_model("bge-reranker-large", "BAAI/bge-reranker-large")
-)
-DEFAULT_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
-DEFAULT_EMBED_API_MODEL = "BAAI/bge-large-en-v1.5"
-DEFAULT_RERANK_API_MODEL = "BAAI/bge-reranker-v2-m3"
-EMBED_API_BATCH_CHUNK = 32
-RERANK_API_BATCH_CHUNK = 32
+RERANKER_LLM_USER_PROMPT = """Score each numbered paragraph for relevance to the research query.
 
+Rubric:
+- 9-10: directly addresses the query's mechanism, experiment, or claim.
+- 7-8: strongly related; covers the same topic or method family with useful detail.
+- 5-6: topically related; partial overlap with the query's subject.
+- 3-4: same broad field only; little direct overlap.
+- 0-2: unrelated to the query.
 
-def _api_env(*names: str) -> str:
-    for name in names:
-        value = str(os.environ.get(name) or "").strip()
-        if value:
-            return value
-    return ""
+Return JSON with this schema only:
+{{"scores":[{{"paragraph_index": 1, "score": 7.5}}]}}
 
+Every paragraph in the list must receive exactly one entry with paragraph_index matching the list number.
 
-def resolve_inference_mode() -> str:
-    """Return 'api' when a remote embeddings endpoint is configured, else 'local'.
+Research query:
+{query_text}
 
-    SCIATLAS_SEARCH_MODE=local|api overrides the auto-detection; the same switch
-    is shared with the rubric retrieval backend (review_pipeline/review/idea_rubric.py).
-    """
-    mode = (_api_env("SCIATLAS_SEARCH_MODE", "GROUNDING_SEARCH_MODE") or "auto").lower()
-    if mode in {"local", "api"}:
-        return mode
-    base_url = _api_env("EMBED_API_BASE_URL", "EMBED_API_URL")
-    api_key = _api_env("EMBED_API_KEY", "LLM_API_KEY", "OPENAI_API_KEY", "DMX_API_KEY", "DMX-API-KEY")
-    return "api" if base_url and api_key else "local"
+Paragraphs:
+{paragraphs_block}
+"""
 
-
-def _join_api_url(base_url: str, suffix: str) -> str:
-    url = base_url.rstrip("/")
-    return url if url.endswith(f"/{suffix}") else f"{url}/{suffix}"
 EXTRACTION_SYSTEM_PROMPT = (
     "You are an expert scientific analysis agent. "
     "Transform a research idea or paper into structured, atomic, evaluation-ready research components. "
@@ -626,194 +603,124 @@ class GroundingLlmClient:
         return parse_experiment_coverage_response(content)
 
 
-class DenseEncoder:
-    def __init__(
-        self,
-        model_name_or_path: str,
-        *,
-        batch_size: int,
-        query_prefix: str,
-        device: str | None = None,
-    ) -> None:
-        from sentence_transformers import SentenceTransformer
-
-        kwargs: dict[str, Any] = {}
-        if device:
-            kwargs["device"] = device
-        self.model = SentenceTransformer(model_name_or_path, **kwargs)
-        self.batch_size = batch_size
-        self.query_prefix = query_prefix
-
-    def encode_paragraphs(self, texts: list[str]) -> np.ndarray:
-        if not texts:
-            return np.zeros((0, 0), dtype=np.float32)
-        embeddings = self.model.encode(
-            texts,
-            batch_size=self.batch_size,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        return np.asarray(embeddings, dtype=np.float32)
-
-    def encode_queries(self, texts: list[str]) -> np.ndarray:
-        prefixed = [f"{self.query_prefix}{text}" if self.query_prefix else text for text in texts]
-        return self.encode_paragraphs(prefixed)
+def _tokenize(text: str) -> list[str]:
+    return _TOKEN_PATTERN.findall(str(text or "").lower())
 
 
-class ParagraphReranker:
-    def __init__(
-        self,
-        model_name_or_path: str,
-        *,
-        batch_size: int,
-        device: str | None = None,
-    ) -> None:
-        from sentence_transformers import CrossEncoder
+def lexical_search(
+    query_text: str,
+    paragraphs: list[ParagraphRecord],
+    *,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    """TF-IDF-style term-overlap retrieval over paragraph texts (pure Python, no local models).
 
-        kwargs: dict[str, Any] = {}
-        if device:
-            kwargs["device"] = device
-        self.model = CrossEncoder(model_name_or_path, **kwargs)
-        self.batch_size = batch_size
+    The returned candidates keep the historical ``dense_score`` key so downstream
+    match consumers stay compatible.
+    """
+    query_terms = set(_tokenize(query_text))
+    if not query_terms or not paragraphs:
+        return []
 
-    def score(self, query_text: str, paragraph_texts: list[str]) -> list[float]:
-        if not paragraph_texts:
-            return []
-        pairs = [[query_text, paragraph_text] for paragraph_text in paragraph_texts]
-        scores = self.model.predict(
-            pairs,
-            batch_size=self.batch_size,
-            show_progress_bar=False,
-        )
-        return [float(score) for score in scores]
+    tokenized: list[list[str]] = []
+    document_frequency: dict[str, int] = {}
+    for paragraph in paragraphs:
+        tokens = _tokenize(paragraph.text)
+        tokenized.append(tokens)
+        for term in set(tokens):
+            document_frequency[term] = document_frequency.get(term, 0) + 1
 
+    total_documents = len(tokenized)
+    scores: list[float] = []
+    for tokens in tokenized:
+        term_frequency: dict[str, int] = {}
+        for token in tokens:
+            term_frequency[token] = term_frequency.get(token, 0) + 1
+        score = 0.0
+        for term in query_terms:
+            count = term_frequency.get(term, 0)
+            if count:
+                idf = math.log(1.0 + total_documents / document_frequency[term])
+                score += (1.0 + math.log(count)) * idf
+        scores.append(score)
 
-class ApiDenseEncoder:
-    """Dense encoder backed by a remote OpenAI-compatible /embeddings endpoint."""
-
-    def __init__(
-        self,
-        *,
-        batch_size: int,
-        query_prefix: str,
-        base_url: str | None = None,
-        api_key: str | None = None,
-        model: str | None = None,
-    ) -> None:
-        self.base_url = _join_api_url(
-            base_url or _api_env("EMBED_API_BASE_URL", "EMBED_API_URL"),
-            "embeddings",
-        )
-        self.api_key = api_key or _api_env("EMBED_API_KEY", "LLM_API_KEY", "OPENAI_API_KEY", "DMX_API_KEY", "DMX-API-KEY")
-        self.model = model or _api_env("EMBED_API_MODEL") or DEFAULT_EMBED_API_MODEL
-        self.chunk_size = max(min(int(batch_size or EMBED_API_BATCH_CHUNK), EMBED_API_BATCH_CHUNK), 1)
-        self.query_prefix = query_prefix
-        if not base_url and not _api_env("EMBED_API_BASE_URL", "EMBED_API_URL"):
-            raise ValueError("ApiDenseEncoder requires EMBED_API_BASE_URL")
-        if not self.api_key:
-            raise ValueError("ApiDenseEncoder requires EMBED_API_KEY (or an LLM API key)")
-
-    def _embed(self, texts: list[str]) -> np.ndarray:
-        vectors: list[list[float]] = []
-        for start in range(0, len(texts), self.chunk_size):
-            chunk = texts[start : start + self.chunk_size]
-            response = requests.post(
-                self.base_url,
-                json={"model": self.model, "input": chunk},
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=180,
-            )
-            response.raise_for_status()
-            data = response.json().get("data") or []
-            ordered = sorted(data, key=lambda item: item.get("index", 0) if isinstance(item, dict) else 0)
-            vectors.extend([item["embedding"] for item in ordered if isinstance(item, dict)])
-        if len(vectors) != len(texts):
-            raise RuntimeError(f"embeddings API returned {len(vectors)} vectors for {len(texts)} inputs")
-        array = np.asarray(vectors, dtype=np.float32)
-        norms = np.linalg.norm(array, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        return array / norms
-
-    def encode_paragraphs(self, texts: list[str]) -> np.ndarray:
-        if not texts:
-            return np.zeros((0, 0), dtype=np.float32)
-        return self._embed(list(texts))
-
-    def encode_queries(self, texts: list[str]) -> np.ndarray:
-        prefixed = [f"{self.query_prefix}{text}" if self.query_prefix else text for text in texts]
-        return self.encode_paragraphs(prefixed)
+    ranked_indices = [index for index, score in enumerate(scores) if score > 0.0]
+    ranked_indices.sort(key=lambda index: scores[index], reverse=True)
+    requested = min(int(top_k), len(ranked_indices))
+    if requested <= 0:
+        return []
+    return [
+        {
+            "paragraph_index": int(index),
+            "dense_score": float(scores[index]),
+        }
+        for index in ranked_indices[:requested]
+    ]
 
 
-class ApiParagraphReranker:
-    """Paragraph reranker backed by a remote /rerank endpoint (SiliconFlow/Jina style)."""
+def _parse_reranker_llm_scores(content: str, expected_count: int) -> list[float]:
+    match = re.search(r"\{.*\}", str(content or ""), flags=re.DOTALL)
+    if not match:
+        raise GroundingError("Reranker LLM response contained no JSON object.")
+    payload = json.loads(match.group(0))
+    raw_scores = payload.get("scores") if isinstance(payload, dict) else None
+    if not isinstance(raw_scores, list):
+        raise GroundingError("Reranker LLM response is missing the 'scores' array.")
+    scores = [0.0] * expected_count
+    for item in raw_scores:
+        if not isinstance(item, dict):
+            continue
+        position = item.get("paragraph_index")
+        score = item.get("score")
+        if isinstance(position, int) and 1 <= position <= expected_count and score is not None:
+            try:
+                scores[position - 1] = float(score)
+            except (TypeError, ValueError):
+                continue
+    return scores
+
+
+class LlmParagraphReranker:
+    """Reranks lexical retrieval candidates with the grounding LLM in batches.
+
+    Raises GroundingError when the LLM fails; callers fall back to lexical order.
+    """
 
     def __init__(
         self,
+        generator: GroundingLlmClient,
         *,
-        batch_size: int,
-        base_url: str | None = None,
-        api_key: str | None = None,
-        model: str | None = None,
+        batch_size: int = DEFAULT_RERANKER_LLM_BATCH,
+        paragraph_max_chars: int = RERANKER_LLM_PARAGRAPH_MAX_CHARS,
     ) -> None:
-        resolved_base = base_url or _api_env("RERANK_API_BASE_URL", "RERANK_API_URL")
-        self.url = _join_api_url(resolved_base, "rerank") if resolved_base else ""
-        self.api_key = api_key or _api_env("RERANK_API_KEY") or _api_env(
-            "EMBED_API_KEY", "LLM_API_KEY", "OPENAI_API_KEY", "DMX_API_KEY", "DMX-API-KEY"
-        )
-        self.model = model or _api_env("RERANK_API_MODEL") or DEFAULT_RERANK_API_MODEL
-        self.chunk_size = max(min(int(batch_size or RERANK_API_BATCH_CHUNK), RERANK_API_BATCH_CHUNK), 1)
-        if not self.url:
-            raise ValueError("ApiParagraphReranker requires RERANK_API_BASE_URL")
-        if not self.api_key:
-            raise ValueError("ApiParagraphReranker requires RERANK_API_KEY (or an LLM API key)")
+        self.generator = generator
+        self.batch_size = max(1, int(batch_size))
+        self.paragraph_max_chars = max(200, int(paragraph_max_chars))
 
     def score(self, query_text: str, paragraph_texts: list[str]) -> list[float]:
         if not paragraph_texts:
             return []
         scores: list[float] = [0.0] * len(paragraph_texts)
-        for start in range(0, len(paragraph_texts), self.chunk_size):
-            chunk = paragraph_texts[start : start + self.chunk_size]
-            response = requests.post(
-                self.url,
-                json={"model": self.model, "query": query_text, "documents": chunk, "top_n": len(chunk)},
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=180,
+        for start in range(0, len(paragraph_texts), self.batch_size):
+            chunk = paragraph_texts[start : start + self.batch_size]
+            numbered: list[str] = []
+            for offset, text in enumerate(chunk, start=1):
+                trimmed = normalize_whitespace(text)
+                if len(trimmed) > self.paragraph_max_chars:
+                    trimmed = trimmed[: self.paragraph_max_chars] + " ..."
+                numbered.append(f"[{offset}] {trimmed}")
+            content = self.generator._request_content(
+                system_prompt=RERANKER_LLM_SYSTEM_PROMPT,
+                user_prompt=RERANKER_LLM_USER_PROMPT.format(
+                    query_text=normalize_whitespace(query_text),
+                    paragraphs_block="\n\n".join(numbered),
+                ),
+                max_tokens=max(200, 40 * len(chunk) + 120),
             )
-            response.raise_for_status()
-            payload = response.json()
-            results = payload.get("results") if isinstance(payload.get("results"), list) else payload.get("data")
-            if not isinstance(results, list):
-                continue
-            for item in results:
-                if not isinstance(item, dict):
-                    continue
-                position = item.get("index")
-                score = item.get("relevance_score", item.get("score"))
-                if isinstance(position, int) and 0 <= position < len(chunk) and score is not None:
-                    scores[start + position] = float(score)
+            batch_scores = _parse_reranker_llm_scores(content, expected_count=len(chunk))
+            for offset, batch_score in enumerate(batch_scores):
+                scores[start + offset] = batch_score
         return scores
-
-
-def build_dense_encoder(args: argparse.Namespace) -> Any:
-    if resolve_inference_mode() == "api":
-        return ApiDenseEncoder(batch_size=args.embedding_batch_size, query_prefix=args.query_prefix)
-    return DenseEncoder(
-        normalize_model_name_or_path(args.embedding_model),
-        batch_size=args.embedding_batch_size,
-        query_prefix=args.query_prefix,
-        device=args.device,
-    )
-
-
-def build_paragraph_reranker(args: argparse.Namespace) -> Any:
-    if resolve_inference_mode() == "api":
-        return ApiParagraphReranker(batch_size=args.reranker_batch_size)
-    return ParagraphReranker(
-        normalize_model_name_or_path(args.reranker_model),
-        batch_size=args.reranker_batch_size,
-        device=args.device,
-    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -865,34 +772,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--embedding-model",
-        "--embedding-model-path",
-        dest="embedding_model",
-        default=DEFAULT_EMBEDDING_MODEL,
-        help="Hugging Face repo id or local sentence-transformers model path for dense retrieval.",
+        "--dense-candidate-k",
+        type=int,
+        default=40,
+        help="Lexical retrieval candidate depth (TF-IDF term overlap).",
     )
-    parser.add_argument(
-        "--query-prefix",
-        default=DEFAULT_QUERY_PREFIX,
-        help="Prefix added to query text before BGE encoding.",
-    )
-    parser.add_argument("--embedding-batch-size", type=int, default=16, help="Batch size for dense embedding.")
-    parser.add_argument("--dense-candidate-k", type=int, default=40, help="Dense retrieval candidate depth.")
 
     parser.add_argument(
         "--disable-reranker",
         action="store_true",
-        help="Skip cross-encoder reranking and rely on dense retrieval only.",
+        help="Skip LLM reranking and rely on lexical retrieval only.",
     )
     parser.add_argument(
-        "--reranker-model",
-        "--reranker-model-path",
-        dest="reranker_model",
-        default=DEFAULT_RERANKER_MODEL,
-        help="Hugging Face repo id or local cross-encoder model path for paragraph reranking.",
+        "--reranker-top-n",
+        type=int,
+        default=20,
+        help="Lexical candidates sent to the LLM reranker.",
     )
-    parser.add_argument("--reranker-top-n", type=int, default=20, help="Dense candidates sent to the reranker.")
-    parser.add_argument("--reranker-batch-size", type=int, default=8, help="Batch size for reranker scoring.")
 
     parser.add_argument("--final-top-k", type=int, default=8, help="Final grounded paragraphs per query.")
     parser.add_argument(
@@ -912,7 +808,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help="How many previous and next paragraphs to include around each refined match.",
     )
-    parser.add_argument("--device", default=None, help="Optional sentence-transformers device override.")
     parser.add_argument(
         "--disable-experiment-grounding",
         action="store_true",
@@ -925,7 +820,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional character cap for serialized paper text sent to extraction. Non-positive means no cap.",
     )
 
-    parser.add_argument("--target-dir", default=str(DEFAULT_TARGET_DIR), help="Cache directory for corpus embeddings.")
+    parser.add_argument("--target-dir", default=str(DEFAULT_TARGET_DIR), help="Cache directory for the paragraph corpus.")
     parser.add_argument("--output", default=None, help="Optional output JSON path.")
     parser.add_argument("--result-tag", default="grounding", help="Tag used in the default output filename.")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print the final JSON output.")
@@ -936,16 +831,6 @@ def normalize_whitespace(text: str | None) -> str:
     if not text:
         return ""
     return " ".join(str(text).split()).strip()
-
-
-def normalize_model_name_or_path(value: str | None) -> str:
-    model_name_or_path = normalize_whitespace(value)
-    if not model_name_or_path:
-        return ""
-    candidate = Path(model_name_or_path).expanduser()
-    if candidate.exists():
-        return str(candidate.resolve())
-    return model_name_or_path
 
 
 def strip_code_fence(text: str) -> str:
@@ -1863,13 +1748,11 @@ def compute_corpus_signature(
     entries: list[dict[str, Any]],
     *,
     corpus_root: Path,
-    embedding_model: str,
     min_chars: int,
     min_words: int,
 ) -> str:
     signature_payload = {
         "corpus_root": str(corpus_root),
-        "embedding_model": embedding_model,
         "min_paragraph_chars": min_chars,
         "min_paragraph_words": min_words,
         "papers": [],
@@ -1898,10 +1781,9 @@ def compute_corpus_signature(
 def load_cached_corpus(
     target_dir: Path,
     signature: str,
-) -> tuple[list[ParagraphRecord], np.ndarray, dict[str, int]] | None:
+) -> tuple[list[ParagraphRecord], dict[str, int]] | None:
     meta_path = target_dir / f"corpus_{signature}.json"
-    emb_path = target_dir / f"corpus_{signature}.npy"
-    if not meta_path.exists() or not emb_path.exists():
+    if not meta_path.exists():
         return None
 
     meta_payload = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1934,10 +1816,7 @@ def load_cached_corpus(
             if isinstance(value, int)
         }
 
-    embeddings = np.load(emb_path)
-    if embeddings.shape[0] != len(paragraphs):
-        return None
-    return paragraphs, np.asarray(embeddings, dtype=np.float32), source_counts
+    return paragraphs, source_counts
 
 
 def save_cached_corpus(
@@ -1945,13 +1824,11 @@ def save_cached_corpus(
     signature: str,
     *,
     paragraphs: list[ParagraphRecord],
-    embeddings: np.ndarray,
     selected_paper_count: int,
     source_counts: dict[str, int],
 ) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
     meta_path = target_dir / f"corpus_{signature}.json"
-    emb_path = target_dir / f"corpus_{signature}.npy"
 
     meta_payload = {
         "signature": signature,
@@ -1961,31 +1838,6 @@ def save_cached_corpus(
         "paragraphs": [paragraph.to_dict() for paragraph in paragraphs],
     }
     meta_path.write_text(json.dumps(meta_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    np.save(emb_path, embeddings)
-
-
-def dense_search(query_embedding: np.ndarray, paragraph_embeddings: np.ndarray, *, top_k: int) -> list[dict[str, Any]]:
-    if paragraph_embeddings.size == 0:
-        return []
-
-    scores = paragraph_embeddings @ query_embedding
-    requested = min(int(top_k), int(scores.shape[0]))
-    if requested <= 0:
-        return []
-
-    if requested == scores.shape[0]:
-        top_indices = np.argsort(scores)[::-1]
-    else:
-        partial = np.argpartition(scores, -requested)[-requested:]
-        top_indices = partial[np.argsort(scores[partial])[::-1]]
-
-    return [
-        {
-            "paragraph_index": int(index),
-            "dense_score": float(scores[index]),
-        }
-        for index in top_indices
-    ]
 
 
 def select_diverse_matches(
@@ -2057,12 +1909,6 @@ def run_grounding(args: argparse.Namespace) -> dict[str, Any]:
     manifest_path = Path(args.manifest).expanduser().resolve()
     corpus_root = resolve_corpus_root(manifest_path, args.papers_root)
     target_dir = Path(args.target_dir).expanduser().resolve()
-    inference_mode = resolve_inference_mode()
-    embedding_model = normalize_model_name_or_path(args.embedding_model)
-    reranker_model = normalize_model_name_or_path(args.reranker_model)
-    if inference_mode == "api":
-        embedding_model = f"api:{_api_env('EMBED_API_MODEL') or DEFAULT_EMBED_API_MODEL}"
-        reranker_model = f"api:{_api_env('RERANK_API_MODEL') or DEFAULT_RERANK_API_MODEL}"
 
     manifest_payload = load_manifest(manifest_path)
     selected_entries = select_paper_entries(manifest_payload, top_k_papers=args.top_k_papers)
@@ -2070,17 +1916,15 @@ def run_grounding(args: argparse.Namespace) -> dict[str, Any]:
     corpus_signature = compute_corpus_signature(
         selected_entries,
         corpus_root=corpus_root,
-        embedding_model=embedding_model,
         min_chars=args.min_paragraph_chars,
         min_words=args.min_paragraph_words,
     )
 
-    dense_encoder = build_dense_encoder(args)
     cache_hit = False
     source_counts: dict[str, int] = {}
     cached_corpus = load_cached_corpus(target_dir, corpus_signature)
     if cached_corpus is not None:
-        paragraphs, paragraph_embeddings, source_counts = cached_corpus
+        paragraphs, source_counts = cached_corpus
         cache_hit = True
     else:
         paragraphs, source_counts = build_paragraph_records(
@@ -2089,18 +1933,15 @@ def run_grounding(args: argparse.Namespace) -> dict[str, Any]:
             min_chars=args.min_paragraph_chars,
             min_words=args.min_paragraph_words,
         )
-        paragraph_embeddings = dense_encoder.encode_paragraphs([paragraph.text for paragraph in paragraphs])
         save_cached_corpus(
             target_dir,
             corpus_signature,
             paragraphs=paragraphs,
-            embeddings=paragraph_embeddings,
             selected_paper_count=len(selected_entries),
             source_counts=source_counts,
         )
 
     queries, idea_extraction, query_generation_meta = generate_queries(idea_text, args=args)
-    query_embeddings = dense_encoder.encode_queries([query.query_text for query in queries])
     refinement_generator: GroundingLlmClient | None = None
     paper_contexts: dict[str, PaperContextRecord] = {}
     refinement_requested = bool(args.enable_grounding_refinement)
@@ -2132,40 +1973,58 @@ def run_grounding(args: argparse.Namespace) -> dict[str, Any]:
             refinement_error = str(exc)
             refinement_generator = None
 
-    reranker: Any = None
+    reranker: LlmParagraphReranker | None = None
     reranker_status = "disabled" if args.disable_reranker else "ok"
     reranker_error: str | None = None
     if not args.disable_reranker:
         try:
-            reranker = build_paragraph_reranker(args)
+            reranker = LlmParagraphReranker(
+                GroundingLlmClient(
+                    QueryGeneratorConfig(
+                        provider=getattr(args, "query_provider", None),
+                        api_url=args.query_api_url,
+                        model=args.query_model,
+                        env_path=Path(args.env),
+                        timeout=args.query_timeout,
+                        max_tokens=args.query_max_tokens,
+                        use_env_proxy=args.use_env_proxy,
+                    )
+                )
+            )
         except Exception as exc:
-            reranker_status = "dense_only_fallback"
+            reranker_status = "lexical_only_fallback"
             reranker_error = str(exc)
 
     retrieval_results: list[dict[str, Any]] = []
-    for query, query_embedding in zip(queries, query_embeddings):
-        dense_candidates = dense_search(
-            query_embedding,
-            paragraph_embeddings,
+    for query in queries:
+        lexical_candidates = lexical_search(
+            query.query_text,
+            paragraphs,
             top_k=args.dense_candidate_k,
         )
 
-        reranked_candidates = list(dense_candidates)
-        if reranker is not None and dense_candidates:
-            rerank_pool = dense_candidates[: min(len(dense_candidates), args.reranker_top_n)]
-            rerank_scores = reranker.score(
-                query.query_text,
-                [paragraphs[candidate["paragraph_index"]].text for candidate in rerank_pool],
-            )
-            reranked_candidates = []
-            for candidate, rerank_score in zip(rerank_pool, rerank_scores):
-                reranked_candidate = dict(candidate)
-                reranked_candidate["rerank_score"] = rerank_score
-                reranked_candidates.append(reranked_candidate)
-            reranked_candidates.sort(
-                key=lambda item: (item.get("rerank_score", float("-inf")), item["dense_score"]),
-                reverse=True,
-            )
+        reranked_candidates = list(lexical_candidates)
+        if reranker is not None and lexical_candidates:
+            rerank_pool = lexical_candidates[: min(len(lexical_candidates), args.reranker_top_n)]
+            try:
+                rerank_scores = reranker.score(
+                    query.query_text,
+                    [paragraphs[candidate["paragraph_index"]].text for candidate in rerank_pool],
+                )
+            except Exception as exc:
+                if reranker_status == "ok":
+                    reranker_status = "partial_fallback"
+                reranker_error = reranker_error or str(exc)
+            else:
+                reranked_candidates = []
+                for candidate, rerank_score in zip(rerank_pool, rerank_scores):
+                    reranked_candidate = dict(candidate)
+                    reranked_candidate["rerank_score"] = rerank_score
+                    reranked_candidates.append(reranked_candidate)
+                reranked_candidates.sort(
+                    key=lambda item: (item.get("rerank_score", float("-inf")), item["dense_score"]),
+                    reverse=True,
+                )
 
         final_candidates = select_diverse_matches(
             reranked_candidates,
@@ -2245,8 +2104,7 @@ def run_grounding(args: argparse.Namespace) -> dict[str, Any]:
             "signature": corpus_signature,
             "selected_paper_count": len(selected_entries),
             "paragraph_count": len(paragraphs),
-            "embedding_model": embedding_model,
-            "embedding_model_path": embedding_model,
+            "retrieval_method": "lexical_tfidf",
             "cache_hit": cache_hit,
             "source_counts": source_counts,
         },
@@ -2264,14 +2122,14 @@ def run_grounding(args: argparse.Namespace) -> dict[str, Any]:
             "queries": [query.to_dict() for query in queries],
         },
         "retrieval": {
-            "dense_candidate_k": args.dense_candidate_k,
+            "lexical_candidate_k": args.dense_candidate_k,
             "final_top_k": args.final_top_k,
             "max_paragraphs_per_paper": args.max_paragraphs_per_paper,
             "reranker_requested": not args.disable_reranker,
             "reranker_status": reranker_status,
             "reranker_error": reranker_error,
-            "reranker_model": None if args.disable_reranker else reranker_model,
-            "reranker_model_path": None if args.disable_reranker else reranker_model,
+            "reranker": "llm" if reranker is not None else None,
+            "reranker_llm_model": reranker.generator.model_name if reranker is not None else None,
             "refinement_requested": refinement_requested,
             "refinement_status": refinement_status,
             "refinement_error": refinement_error,

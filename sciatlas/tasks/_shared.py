@@ -160,31 +160,6 @@ def _default_query_model(env_path: Path) -> str | None:
     return resolve_llm_settings(env_path, {}, require_api_key=False).model
 
 
-def _apply_grounding_model_env_defaults(params: dict[str, Any], env_path: Path) -> None:
-    env_values = load_env_values(env_path)
-    if not normalize_whitespace(params.get("embedding_model")) and not normalize_whitespace(params.get("embedding_model_path")):
-        embedding_model = get_env_value(
-            env_values,
-            "SCIATLAS_EMBEDDING_MODEL_PATH",
-            "SCIATLAS_EMBEDDING_MODEL",
-            "GROUNDING_EMBEDDING_MODEL_PATH",
-            "GROUNDING_EMBEDDING_MODEL",
-        )
-        if embedding_model:
-            params["embedding_model_path"] = embedding_model
-
-    if not normalize_whitespace(params.get("reranker_model")) and not normalize_whitespace(params.get("reranker_model_path")):
-        reranker_model = get_env_value(
-            env_values,
-            "SCIATLAS_RERANKER_MODEL_PATH",
-            "SCIATLAS_RERANKER_MODEL",
-            "GROUNDING_RERANKER_MODEL_PATH",
-            "GROUNDING_RERANKER_MODEL",
-        )
-        if reranker_model:
-            params["reranker_model_path"] = reranker_model
-
-
 def _run_grounding(
     *,
     input_payload: dict[str, Any],
@@ -226,22 +201,10 @@ def _run_grounding(
     if query_api_url:
         cli_args.extend(["--query-api-url", query_api_url])
 
-    embedding_model = normalize_whitespace(params.get("embedding_model")) or normalize_whitespace(
-        params.get("embedding_model_path")
-    )
-    if embedding_model:
-        cli_args.extend(["--embedding-model", embedding_model])
-    reranker_model = normalize_whitespace(params.get("reranker_model")) or normalize_whitespace(
-        params.get("reranker_model_path")
-    )
-    if reranker_model:
-        cli_args.extend(["--reranker-model", reranker_model])
     if params.get("enable_grounding_refinement"):
         cli_args.append("--enable-grounding-refinement")
     if params.get("disable_experiment_grounding", True):
         cli_args.append("--disable-experiment-grounding")
-    if params.get("grounding_device"):
-        cli_args.extend(["--device", str(params["grounding_device"])])
     if params.get("use_env_proxy"):
         cli_args.append("--use-env-proxy")
 
@@ -578,7 +541,6 @@ def _build_supporting_papers(authors: list[dict[str, Any]]) -> list[dict[str, An
 
 def execute_grounded_review(request: SciAtlasRequest, run_dir: Path, client: SciAtlasApiClient) -> dict[str, Any]:
     params = merge_task_params(request.task_type, request.params)
-    _apply_grounding_model_env_defaults(params, request.env_path)
     artifact_root = ensure_dir(run_dir / "artifacts")
     search_artifact_dir = ensure_dir(artifact_root / "search")
     plan = _build_search_plan(

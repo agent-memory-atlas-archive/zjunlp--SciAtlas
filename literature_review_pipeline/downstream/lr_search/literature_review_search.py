@@ -241,8 +241,6 @@ class DmxJsonClient:
         wire_api: str = "chat_completions",
         mock: bool = False,
     ) -> None:
-        self.api_url = api_url
-        self.model = model
         self.timeout = timeout
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -252,15 +250,52 @@ class DmxJsonClient:
         env_values = load_env_values(env_path)
         self.api_key = (
             normalize_whitespace(api_key_override)
+            or normalize_whitespace(os.environ.get("LLM_API_KEY"))
             or normalize_whitespace(os.environ.get("DMX-API-KEY"))
             or normalize_whitespace(os.environ.get("DMX_API_KEY"))
             or normalize_whitespace(os.environ.get("OPENAI_API_KEY"))
+            or normalize_whitespace(env_values.get("LLM_API_KEY"))
             or normalize_whitespace(env_values.get("DMX-API-KEY"))
             or normalize_whitespace(env_values.get("DMX_API_KEY"))
             or normalize_whitespace(env_values.get("OPENAI_API_KEY"))
         )
         if not self.api_key and not mock:
             raise RuntimeError(f"Missing DMX API key in environment or {env_path}")
+        if normalize_whitespace(model) and model != DEFAULT_DMX_MODEL:
+            self.model = model
+        else:
+            self.model = (
+                normalize_whitespace(os.environ.get("SEARCH_LLM_MODEL"))
+                or normalize_whitespace(os.environ.get("LLM_MODEL"))
+                or normalize_whitespace(os.environ.get("OPENAI_MODEL"))
+                or normalize_whitespace(env_values.get("SEARCH_LLM_MODEL"))
+                or normalize_whitespace(env_values.get("LLM_MODEL"))
+                or normalize_whitespace(env_values.get("OPENAI_MODEL"))
+                or DEFAULT_DMX_MODEL
+            )
+        resolved_url = normalize_whitespace(api_url)
+        if not resolved_url or resolved_url == DEFAULT_DMX_API_URL:
+            resolved_url = (
+                normalize_whitespace(os.environ.get("SEARCH_LLM_API_URL"))
+                or normalize_whitespace(os.environ.get("LLM_CHAT_COMPLETIONS_URL"))
+                or normalize_whitespace(os.environ.get("LLM_API_URL"))
+                or normalize_whitespace(os.environ.get("OPENAI_CHAT_COMPLETIONS_URL"))
+                or normalize_whitespace(env_values.get("SEARCH_LLM_API_URL"))
+                or normalize_whitespace(env_values.get("LLM_CHAT_COMPLETIONS_URL"))
+                or normalize_whitespace(env_values.get("LLM_API_URL"))
+                or normalize_whitespace(env_values.get("OPENAI_CHAT_COMPLETIONS_URL"))
+            )
+            if not resolved_url:
+                base_url = (
+                    normalize_whitespace(os.environ.get("LLM_BASE_URL"))
+                    or normalize_whitespace(os.environ.get("OPENAI_BASE_URL"))
+                    or normalize_whitespace(env_values.get("LLM_BASE_URL"))
+                    or normalize_whitespace(env_values.get("OPENAI_BASE_URL"))
+                ).rstrip("/")
+                if base_url:
+                    resolved_url = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
+            resolved_url = resolved_url or DEFAULT_DMX_API_URL
+        self.api_url = resolved_url
         self.opener = urllib.request.build_opener() if use_env_proxy else urllib.request.build_opener(
             urllib.request.ProxyHandler({})
         )

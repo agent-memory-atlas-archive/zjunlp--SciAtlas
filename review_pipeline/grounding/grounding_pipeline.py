@@ -116,7 +116,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--final-top-k", type=int, default=8)
     parser.add_argument("--target-dir", default=str(sciatlas_grounding.DEFAULT_TARGET_DIR))
     parser.add_argument("--output", default=None)
-    parser.add_argument("--device", default=None)
     parser.add_argument("--idea-context", default=None)
     parser.add_argument("--idea-text", default=None)
     parser.add_argument("--pdf-path", default=None)
@@ -154,8 +153,6 @@ def run_grounding(args: argparse.Namespace) -> dict[str, Any]:
         cli_args.extend(["--pdf-path", pdf_path])
     else:
         cli_args.extend(["--idea-text", idea_text])
-    if getattr(args, "device", None):
-        cli_args.extend(["--device", str(args.device)])
     if getattr(args, "enable_grounding_refinement", False):
         cli_args.append("--enable-grounding-refinement")
     if getattr(args, "disable_reranker", False):

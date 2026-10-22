@@ -15,7 +15,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from worker_common import build_file_logger, load_json, normalize_whitespace, write_json
-from cuda_devices import default_torch_device, device_at, first_configured_cuda_devices, format_cuda_devices
 
 RUBRIC_SCHEMA_VERSION = 5
 
@@ -46,24 +45,11 @@ def run_smoke(payload: dict[str, Any], work_dir: Path) -> dict[str, Any]:
     }
 
 
-def visible_device_count(cuda_visible_devices: str | None) -> int:
-    visible = normalize_whitespace(cuda_visible_devices) or normalize_whitespace(os.environ.get("CUDA_VISIBLE_DEVICES"))
-    if not visible:
-        return 0
-    return len([item.strip() for item in visible.split(",") if item.strip()])
-
-
 def run_real(payload: dict[str, Any], work_dir: Path, cuda_visible_devices: str | None) -> dict[str, Any]:
     from review.idea_rubric import DEFAULT_MAX_WORKERS, IdeaRubricConfig, run_rubric_sources
 
     if cuda_visible_devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
-    visible_count = visible_device_count(cuda_visible_devices)
-    configured_devices = first_configured_cuda_devices()
-    default_embed_device = device_at(configured_devices, 0) or default_torch_device(index=0)
-    default_rerank_device = device_at(configured_devices, 1) or default_torch_device(
-        index=0 if visible_count == 1 else 1
-    )
 
     config = IdeaRubricConfig(
         target_idea=normalize_whitespace(payload.get("idea_text")),
@@ -75,10 +61,6 @@ def run_real(payload: dict[str, Any], work_dir: Path, cuda_visible_devices: str 
         search_top_k=int(payload["search_top_k"]) if payload.get("search_top_k") is not None else 50,
         search_final_k=int(payload["search_final_k"]) if payload.get("search_final_k") is not None else 15,
         max_workers=int(payload["max_workers"]) if payload.get("max_workers") is not None else DEFAULT_MAX_WORKERS,
-        precomputed_root=normalize_whitespace(payload.get("precomputed_root")),
-        search_mode=normalize_whitespace(payload.get("search_mode")),
-        embed_device=normalize_whitespace(payload.get("embed_device")) or default_embed_device,
-        rerank_device=normalize_whitespace(payload.get("rerank_device")) or default_rerank_device,
     )
 
     result = run_rubric_sources(config)
@@ -92,7 +74,6 @@ def run_real(payload: dict[str, Any], work_dir: Path, cuda_visible_devices: str 
         "processing_index_path": result["processing_index_path"],
         "timing_log_path": result.get("timing_log_path"),
         "work_dir": str(work_dir),
-        "cuda_devices": format_cuda_devices(configured_devices),
     }
 
 

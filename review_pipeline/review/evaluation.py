@@ -34,7 +34,7 @@ SECTION_EVIDENCE_PRIORITY = {
 }
 
 
-@dataclass(slots=True)
+@dataclass
 class ReviewGenerationConfig:
     env_path: Path | None = None
     llm_api_key: str | None = None
@@ -106,13 +106,24 @@ def _resolve_config(config: ReviewGenerationConfig) -> ReviewGenerationConfig:
         env_path=Path(config.env_path).expanduser().resolve() if config.env_path else None,
         llm_api_key=first_non_empty(
             config.llm_api_key,
+            env_values.get("LLM_API_KEY"),
             env_values.get("DMX-API-KEY"),
             env_values.get("DMX_API_KEY"),
             env_values.get("OPENAI_API_KEY"),
         )
         or None,
-        llm_base_url=first_non_empty(config.llm_base_url, env_values.get("OPENAI_BASE_URL"), DEFAULT_LLM_BASE_URL),
-        llm_model_name=first_non_empty(config.llm_model_name, DEFAULT_LLM_MODEL_NAME),
+        llm_base_url=first_non_empty(
+            "" if config.llm_base_url == DEFAULT_LLM_BASE_URL else config.llm_base_url,
+            env_values.get("LLM_BASE_URL"),
+            env_values.get("OPENAI_BASE_URL"),
+            DEFAULT_LLM_BASE_URL,
+        ),
+        llm_model_name=first_non_empty(
+            "" if config.llm_model_name == DEFAULT_LLM_MODEL_NAME else config.llm_model_name,
+            env_values.get("LLM_MODEL"),
+            env_values.get("OPENAI_MODEL"),
+            DEFAULT_LLM_MODEL_NAME,
+        ),
         llm_temperature=float(config.llm_temperature),
         enable_llm=bool(config.enable_llm),
         smoke=bool(config.smoke),

@@ -35,7 +35,7 @@ DEFAULT_LLM_MODEL_NAME = "DeepSeek-V3.2"
 DEFAULT_DEVICE = default_torch_device()
 
 
-@dataclass(slots=True)
+@dataclass
 class SharedSentenceTransformer:
     model: SentenceTransformer
     encode_lock: threading.Lock
@@ -49,7 +49,7 @@ _SHARED_MODEL_CACHE: dict[tuple[str, str], SharedSentenceTransformer] = {}
 _SHARED_MODEL_CACHE_LOCK = threading.Lock()
 
 
-@dataclass(slots=True)
+@dataclass
 class AuthorBackgroundConfig:
     target_author: str
     target_idea: str
@@ -366,17 +366,24 @@ def _resolve_config(config: AuthorBackgroundConfig) -> AuthorBackgroundConfig:
         top_k_relevant=int(config.top_k_relevant),
         llm_api_key=first_non_empty(
             config.llm_api_key,
+            env_values.get("LLM_API_KEY"),
             env_values.get("DMX-API-KEY"),
             env_values.get("DMX_API_KEY"),
             env_values.get("OPENAI_API_KEY"),
         )
         or None,
         llm_base_url=first_non_empty(
-            config.llm_base_url,
+            "" if config.llm_base_url == DEFAULT_LLM_BASE_URL else config.llm_base_url,
+            env_values.get("LLM_BASE_URL"),
             env_values.get("OPENAI_BASE_URL"),
             DEFAULT_LLM_BASE_URL,
         ),
-        llm_model_name=first_non_empty(config.llm_model_name, DEFAULT_LLM_MODEL_NAME),
+        llm_model_name=first_non_empty(
+            "" if config.llm_model_name == DEFAULT_LLM_MODEL_NAME else config.llm_model_name,
+            env_values.get("LLM_MODEL"),
+            env_values.get("OPENAI_MODEL"),
+            DEFAULT_LLM_MODEL_NAME,
+        ),
         device=first_non_empty(config.device, DEFAULT_DEVICE),
         persona_subject=first_non_empty(
             config.persona_subject,

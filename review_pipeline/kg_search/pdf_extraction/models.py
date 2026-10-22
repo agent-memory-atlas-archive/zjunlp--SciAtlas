@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 
 
-@dataclass(slots=True)
+@dataclass
 class PdfReference:
     ref_id: str = ""
     title: str = ""
@@ -13,7 +13,7 @@ class PdfReference:
     contexts: list[str] = field(default_factory=list)
 
 
-@dataclass(slots=True)
+@dataclass
 class PdfSection:
     heading: str = ""
     paragraphs: list[str] = field(default_factory=list)
@@ -27,7 +27,7 @@ class PdfSection:
         }
 
 
-@dataclass(slots=True)
+@dataclass
 class ExtractedPdfDocument:
     title: str = ""
     abstract: str = ""

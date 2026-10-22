@@ -2,16 +2,12 @@
 """Standalone rubric-generation entry point.
 
 Runs only the rubric branch (rubric_sources -> rubric_llm) of the review
-pipeline, without the KG / Semantic Scholar / GROBID / reviewer infrastructure.
+pipeline, without the reviewer / grounding / report infrastructure.
 
 Prerequisites:
   1. An LLM API key in .env (LLM_API_KEY / DMX-API-KEY / OPENAI_API_KEY).
-  2. Embedding/rerank models under <repo>/models/ (auto-detected; see README
-     quickstart for download commands).
-  3. The precomputed asset pack (python scripts/download_rubric_assets.py),
-     or local access to the NC dataset.
-
-Run `python scripts/check_rubric_setup.py` to verify the full setup.
+  2. SCIATLAS_API_KEY for the hosted SciAtlas KG backend
+     (register at sciatlas.openkg.cn).
 
 Example:
   python run_rubric.py --idea "Using graph neural networks to predict catalyst stability"
@@ -21,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import traceback
 from datetime import datetime
@@ -29,7 +24,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 REVIEW_PIPELINE = ROOT / "review_pipeline"
-DEFAULT_ASSETS_ROOT = ROOT / "assets" / "rubric"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,20 +35,10 @@ def build_parser() -> argparse.ArgumentParser:
     input_group.add_argument("--idea-file", default=None, help="Path to a UTF-8 file containing the idea text.")
     parser.add_argument("--env", default=str(ROOT / ".env"), help="Path to the .env file with API credentials.")
     parser.add_argument("--output-dir", default=None, help="Run output directory. Default: runs/rubric_<timestamp>.")
-    parser.add_argument(
-        "--precomputed-root",
-        default=None,
-        help="Precomputed asset pack root. Default: <repo>/assets/rubric when present.",
-    )
-    parser.add_argument("--search-top-k", type=int, default=50, help="FAISS recall depth.")
-    parser.add_argument("--search-final-k", type=int, default=15, help="Papers kept after reranking.")
+    parser.add_argument("--search-top-k", type=int, default=50, help="Hosted KG retrieval depth.")
+    parser.add_argument("--search-final-k", type=int, default=15, help="Papers kept after LLM reranking.")
     parser.add_argument("--max-workers", type=int, default=8, help="Per-paper processing concurrency.")
     parser.add_argument("--llm-timeout-seconds", type=int, default=300, help="Per-call LLM timeout.")
-    parser.add_argument(
-        "--cuda-devices",
-        default=None,
-        help="Comma-separated CUDA device ids for local mode, e.g. 0,7 (sets INNOEVAL_CUDA_DEVICES).",
-    )
     return parser
 
 
@@ -69,14 +53,6 @@ def main(argv: list[str] | None = None) -> int:
     idea_text = _resolve_idea(args)
     if not idea_text:
         raise SystemExit("Empty idea text.")
-
-    if args.cuda_devices:
-        os.environ["INNOEVAL_CUDA_DEVICES"] = args.cuda_devices
-    precomputed_root = args.precomputed_root
-    if not precomputed_root and (DEFAULT_ASSETS_ROOT / "papers").is_dir():
-        precomputed_root = str(DEFAULT_ASSETS_ROOT)
-    if precomputed_root:
-        os.environ["RUBRIC_PRECOMPUTED_ROOT"] = str(Path(precomputed_root).expanduser().resolve())
 
     env_path = Path(args.env).expanduser().resolve()
     if not env_path.exists():

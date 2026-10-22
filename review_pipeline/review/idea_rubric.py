@@ -3,8 +3,6 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
-import re
-import shutil
 import sys
 import threading
 import time
@@ -12,12 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import faiss
-import numpy as np
-import requests
 from pydantic import BaseModel, Field
 
-from cuda_devices import default_torch_device, device_at, first_configured_cuda_devices
+from kg_search.service_hosted import hosted_kg_search
 from .common import (
     LEGACY_SECTION_ALIASES,
     REVIEW_SECTIONS,
@@ -35,25 +30,36 @@ from .llm_retry import call_llm_json_with_retry
 DEFAULT_LLM_BASE_URL = "https://www.dmxapi.cn/v1"
 DEFAULT_LLM_MODEL_NAME = "DeepSeek-V3.2"
 DEFAULT_LLM_TEMPERATURE = 0.3
-DEFAULT_EMBED_MODEL_PATH = "/data1/bge-model/AI-ModelScope/bge-large-en-v1.5"
-DEFAULT_RERANK_MODEL_PATH = "/data1/bge-reranker-large"
-DEFAULT_FAISS_INDEX_PATH = "/data1/nc_dataset/merged_nc_dataset/faiss_nc.index"
-DEFAULT_NC_META_PATH = "/data1/nc_dataset/merged_nc_dataset/nc_meta.json"
 DEFAULT_SEARCH_TOP_K = 50
 DEFAULT_SEARCH_FINAL_K = 15
 DEFAULT_MAX_WORKERS = 8
-DEFAULT_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
-DEFAULT_EMBED_API_MODEL = "BAAI/bge-large-en-v1.5"
-DEFAULT_RERANK_API_MODEL = "BAAI/bge-reranker-v2-m3"
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_PRECOMPUTED_ROOT = PROJECT_ROOT / "assets" / "rubric"
-DEFAULT_LOCAL_MODELS_DIR = PROJECT_ROOT / "models"
-LOCAL_EMBED_MODEL_DIRNAME = "bge-large-en-v1.5"
-LOCAL_RERANK_MODEL_DIRNAME = "bge-reranker-large"
-_DEFAULT_CUDA_DEVICES = first_configured_cuda_devices()
-DEFAULT_EMBED_DEVICE = device_at(_DEFAULT_CUDA_DEVICES, 0) or default_torch_device(index=0)
-DEFAULT_RERANK_DEVICE = device_at(_DEFAULT_CUDA_DEVICES, 1) or default_torch_device(index=1)
+DEFAULT_RERANK_BATCH_SIZE = 5
+PERSONA_PROMPTS_PATH = Path(__file__).with_name("persona_prompts.json")
 RUBRIC_SCHEMA_VERSION = 5
+RERANK_SYSTEM_PROMPT = (
+    "You are a rigorous academic literature relevance judge. "
+    "Score each candidate paper independently and return strict JSON only."
+)
+ABSTRACT_REVIEW_NORMS_SYSTEM_PROMPT = """You are a rigorous senior reviewer for a top journal in this paper's field.
+You are given only a candidate paper's title, abstract, and publication metadata, plus reviewer-persona notes describing how demanding reviewers evaluate submissions.
+Write the review norms such reviewers would apply when judging work like this paper: the concrete checks, evidence demands, and methodological expectations.
+Rules:
+1. Ground every norm in what the abstract and persona notes actually support; do not hallucinate paper details.
+2. Each norm must be a single actionable demand, phrased in professional reviewer language.
+3. Prefer field-specific terminology over generic labels such as "novelty" or "clarity" alone.
+4. Produce 8 to 12 norms.
+5. If a norm mentions a formula, variable, or metric, use Markdown math notation such as `$x$` or `$$ ... $$`, never backticks.
+All output MUST be strictly in English."""
+ABSTRACT_DIMENSIONS_SYSTEM_PROMPT = """You are an expert reviewer.
+You are given a candidate paper's title, abstract summary, and a set of review norms describing how demanding reviewers in this field judge submissions.
+Extract reviewer evaluation standards for four modules: Introduction, Methods, Results, and Discussion.
+Rules:
+1. Ground each standard in what the abstract and review norms actually support; do not hallucinate specifics.
+2. Each standard must be concrete and anchored to this paper's problem framing, method claims, evaluation expectations, or limitations.
+3. Use professional reviewer language; avoid broad standalone labels such as "novelty", "clarity", or "effectiveness" alone.
+4. Produce 2 to 4 standards per module.
+5. If a standard mentions a formula, variable, or metric, use Markdown math notation such as `$x$` or `$$ ... $$`, never backticks.
+All output MUST be strictly in English."""
 GENERAL_RUBRIC_SYSTEM_PROMPT = """You are a senior academic reviewer for a top journal.
 CREATE A PROFESSIONAL EVALUATION RUBRIC divided into Motivation, Method, Result, and Discussion.
 Synthesize historical standards and adjust them tightly to the user's idea. The rubric should be balanced across the four sections and should not read like generic journal-review criteria.
@@ -184,7 +190,7 @@ class SectionedSynthesisRubric(BaseModel):
     Discussion_Standards: list[RefinedStandard] = Field(description="Final standards for Discussion.")
 
 
-@dataclass(slots=True)
+@dataclass
 class IdeaRubricConfig:
     target_idea: str
     artifact_root: Path
@@ -196,31 +202,31 @@ class IdeaRubricConfig:
     llm_model_name: str = ""
     llm_temperature: float = DEFAULT_LLM_TEMPERATURE
     llm_timeout_seconds: int = 300
-    embed_model_path: str = ""
-    rerank_model_path: str = ""
-    faiss_index_path: str = ""
-    nc_meta_path: str = ""
-    precomputed_root: str = ""
-    search_mode: str = ""
-    embed_api_base_url: str = ""
-    embed_api_key: str = ""
-    embed_api_model: str = ""
-    rerank_api_base_url: str = ""
-    rerank_api_key: str = ""
-    rerank_api_model: str = ""
     search_top_k: int = DEFAULT_SEARCH_TOP_K
     search_final_k: int = DEFAULT_SEARCH_FINAL_K
     max_workers: int = DEFAULT_MAX_WORKERS
-    embed_device: str = DEFAULT_EMBED_DEVICE
-    rerank_device: str = DEFAULT_RERANK_DEVICE
+    rerank_batch_size: int = DEFAULT_RERANK_BATCH_SIZE
 
 
-def _clean_json_response(result_str: str) -> str:
-    stripped = result_str.strip()
-    match = re.search(r"(\{.*\}|\[.*\])", stripped, re.DOTALL)
-    if match:
-        return match.group(0)
-    return stripped
+class RerankPaperScore(BaseModel):
+    paper_index: int = Field(description="1-based index of the candidate paper in the batch.")
+    score: float = Field(description="Relevance score in [0, 10].")
+    reason: str = Field(default="", description="Short reason for the score.")
+
+
+class RerankBatchScores(BaseModel):
+    papers: list[RerankPaperScore] = Field(description="One entry per candidate paper in the batch.")
+
+
+class ReviewNorms(BaseModel):
+    norms: list[str] = Field(description="Review norms, each a single actionable reviewer demand.")
+
+
+class PaperModuleDimensions(BaseModel):
+    introduction_standards: list[ExtractedDimension] = Field(description="Standards for the Introduction module.")
+    methods_standards: list[ExtractedDimension] = Field(description="Standards for the Methods module.")
+    results_standards: list[ExtractedDimension] = Field(description="Standards for the Results module.")
+    discussion_standards: list[ExtractedDimension] = Field(description="Standards for the Discussion module.")
 
 
 def _compact_text(value: Any) -> str:
@@ -286,113 +292,9 @@ def _summarize_detailed_rubric_for_synthesis(detailed_result: dict[str, Any]) ->
     return "\n".join(lines)
 
 
-def _extract_pdf_text(pdf_path: Path) -> str:
-    try:
-        import fitz
-
-        document = fitz.open(pdf_path)
-        return "\n".join(page.get_text("text") for page in document)
-    except Exception:
-        return ""
-
-
 def _write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-
-
-def _filter_review_report(full_text: str) -> str:
-    text = re.sub(r"\r\n|\r", "\n", full_text)
-    start_patterns = [
-        r"(?i)(Reviewers['’]?\s*comments\s*:?)",
-        r"(?i)(Reviewer\s*(?:#)?\s*1\s*:?)",
-        r"(?i)(Comments to the Author(?:s)?\s*:?)",
-    ]
-    end_patterns = [
-        r"(?i)(Author(?:['’]s)?\s*Rebuttal)",
-        r"(?i)(Point-by-point\s*response)",
-        r"(?i)(Publisher['’]s note)",
-    ]
-
-    start_index = 0
-    for pattern in start_patterns:
-        match = re.search(pattern, text)
-        if match:
-            start_index = match.start()
-            break
-
-    end_index = len(text)
-    for pattern in end_patterns:
-        match = re.search(pattern, text[start_index:])
-        if match and start_index + match.start() < end_index:
-            end_index = start_index + match.start()
-
-    clean_text = text[start_index:end_index].strip()
-    if len(clean_text) >= 200:
-        return clean_text
-    return text[min(500, len(text)) : end_index].strip()
-
-
-def _fetch_pmc_xml_by_doi(doi: str) -> bytes | None:
-    clean_doi = normalize_whitespace(doi)
-    if not clean_doi:
-        return None
-    clean_doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", clean_doi, flags=re.IGNORECASE)
-    clean_doi = clean_doi.strip()
-
-    search_url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
-    try:
-        response = requests.get(
-            search_url,
-            params={"query": f"DOI:{clean_doi}", "format": "json"},
-            timeout=10,
-        )
-        response.raise_for_status()
-        result_list = response.json().get("resultList", {}).get("result", [])
-        pmcid = normalize_whitespace(result_list[0].get("pmcid")) if result_list else ""
-        if not pmcid:
-            return None
-        fulltext_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
-        xml_response = requests.get(fulltext_url, timeout=15)
-        xml_response.raise_for_status()
-        return xml_response.content
-    except Exception:
-        return None
-
-
-def _parse_jats_xml_sections(xml_content: bytes) -> dict[str, str]:
-    from bs4 import BeautifulSoup
-
-    soup = BeautifulSoup(xml_content, "xml")
-    sections = {
-        "Abstract": "",
-        "Introduction": "",
-        "Results": "",
-        "Discussion": "",
-        "Methods": "",
-    }
-
-    abstract_tag = soup.find("abstract")
-    if abstract_tag:
-        sections["Abstract"] = abstract_tag.get_text(separator="\n", strip=True)
-
-    body_tag = soup.find("body")
-    if body_tag:
-        for sec in body_tag.find_all("sec", recursive=False):
-            title_tag = sec.find("title")
-            if not title_tag:
-                continue
-            title_text = title_tag.get_text(strip=True).lower()
-            content = sec.get_text(separator="\n", strip=True)[len(title_tag.get_text(strip=True)) :].strip()
-            if "introduction" in title_text or "background" in title_text:
-                sections["Introduction"] = content
-            elif "result" in title_text:
-                sections["Results"] = content
-            elif "discussion" in title_text or "conclusion" in title_text:
-                sections["Discussion"] = content
-            elif "method" in title_text or "experimental" in title_text:
-                sections["Methods"] = content
-    return sections
 
 
 GENERAL_SECTION_KEYS = tuple(RUBRIC_STANDARD_KEYS[section] for section in REVIEW_SECTIONS)
@@ -508,160 +410,145 @@ def _build_canonical_rubric(
     return rubric
 
 
-def _load_faiss_assets(config: IdeaRubricConfig) -> tuple[Any, list[dict[str, Any]]]:
-    index = faiss.read_index(config.faiss_index_path)
-    metadata_store = json.loads(Path(config.nc_meta_path).read_text(encoding="utf-8"))
-    return index, metadata_store
+def _build_rerank_prompt(idea: str, batch: list[dict[str, Any]]) -> str:
+    paper_blocks = []
+    for slot, doc in enumerate(batch, start=1):
+        abstract = normalize_whitespace(doc.get("Abstract")) or "[missing abstract]"
+        paper_blocks.append(f"[{slot}] Title: {normalize_whitespace(doc.get('Title'))}\nAbstract: {abstract}")
+    return "\n\n".join(
+        [
+            "Evaluate how substantively relevant each candidate paper is to the research idea below.",
+            "",
+            "Scoring target:",
+            "- Judge each paper independently, not comparatively.",
+            "- Focus on overlap in the core research problem, evaluation target, inputs/outputs, and methodological purpose.",
+            "- A paper can score high even if the method differs, as long as it directly addresses the same problem.",
+            "- Penalize papers that only share broad themes such as LLMs, scientific discovery, benchmarks, or evaluation.",
+            "",
+            "Rubric:",
+            "- 9-10: Extremely close neighbor; essentially the same problem.",
+            "- 7-8: Directly relevant; strong task or evaluation overlap.",
+            "- 5-6: Meaningful partial overlap, but not the same core problem.",
+            "- 3-4: Weak topical relation only.",
+            "- 0-2: Effectively irrelevant.",
+            "",
+            'Return ONLY JSON in this format: {"papers":[{"paper_index":1,"score":8.7,"reason":"short reason"}]}',
+            "",
+            "Requirements for output:",
+            "- Include every paper exactly once.",
+            "- score must be a number in [0, 10].",
+            "- reason must be concise and mention the main match or mismatch.",
+            "",
+            f"Research idea:\n{normalize_whitespace(idea)}",
+            "Candidate papers:\n" + "\n\n".join(paper_blocks),
+        ]
+    )
 
 
-def _faiss_recall(
-    index: Any,
-    metadata_store: list[dict[str, Any]],
-    query_vector: Any,
-    idea: str,
-    top_k: int,
-) -> list[dict[str, Any]]:
-    distances, indices = index.search(np.array([np.asarray(query_vector, dtype="float32")]), top_k + 5)
-    retrieved_docs: list[dict[str, Any]] = []
-    idea_lower = idea.strip().lower()
-    for idx_pos, metadata_position in enumerate(indices[0]):
-        if int(metadata_position) < 0:
-            continue
-        doc = dict(metadata_store[int(metadata_position)])
-        title = normalize_whitespace(doc.get("Title"))
-        if title and title.lower() in idea_lower:
-            continue
-        if float(distances[0][idx_pos]) > 0.9:
-            continue
-        retrieved_docs.append(doc)
-        if len(retrieved_docs) >= top_k:
-            break
-    return retrieved_docs
+def _load_general_persona_notes(limit: int = 8) -> list[str]:
+    try:
+        payload = json.loads(PERSONA_PROMPTS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    entries = payload.get("groups", {}).get("general", []) if isinstance(payload.get("groups"), dict) else []
+    notes: list[str] = []
+    for item in entries[:limit]:
+        if isinstance(item, dict):
+            note = normalize_whitespace(item.get("text"))
+            if note:
+                notes.append(note)
+    return notes
 
 
-class PaperSearchEngine:
-    def __init__(self, config: IdeaRubricConfig) -> None:
-        from sentence_transformers import CrossEncoder, SentenceTransformer
+class KgRubricSearch:
+    """Hosted KG retrieval plus LLM relevance reranking for rubric sources.
 
-        self.index, self.metadata_store = _load_faiss_assets(config)
-        self._check_local_model_path(config.embed_model_path, "embedding")
-        self._check_local_model_path(config.rerank_model_path, "reranker")
-        self.embed_model = SentenceTransformer(config.embed_model_path, device=config.embed_device)
-        self.rerank_model = CrossEncoder(config.rerank_model_path, device=config.rerank_device)
-
-    @staticmethod
-    def _check_local_model_path(model_path: str, kind: str) -> None:
-        candidate = Path(model_path).expanduser()
-        if candidate.exists():
-            return
-        if "/" in model_path and not model_path.startswith("http"):
-            raise FileNotFoundError(
-                f"Local {kind} model not found at {model_path}. Download the models once "
-                "(see the README quickstart): huggingface-cli download BAAI/bge-large-en-v1.5 "
-                "--local-dir <repo>/models/bge-large-en-v1.5 (and BAAI/bge-reranker-large), "
-                "or configure a remote embeddings API via EMBED_API_BASE_URL/EMBED_API_KEY."
-            )
-
-    def search(self, idea: str, *, top_k: int, final_k: int) -> list[dict[str, Any]]:
-        query_vector = self.embed_model.encode(
-            [DEFAULT_QUERY_PREFIX + idea],
-            normalize_embeddings=True,
-        )[0]
-        retrieved_docs = _faiss_recall(self.index, self.metadata_store, query_vector, idea, top_k)
-        cross_inputs = [[idea, doc["doc_text"]] for doc in retrieved_docs]
-        rerank_scores = self.rerank_model.predict(cross_inputs, batch_size=16)
-        for index, doc in enumerate(retrieved_docs):
-            doc["rerank_score"] = float(rerank_scores[index])
-        return sorted(retrieved_docs, key=lambda item: item["rerank_score"], reverse=True)[:final_k]
-
-
-def _join_api_url(base_url: str, suffix: str) -> str:
-    url = base_url.rstrip("/")
-    return url if url.endswith(f"/{suffix}") else f"{url}/{suffix}"
-
-
-class ApiSearchEngine:
-    """FAISS recall with a remote OpenAI-compatible embeddings API plus an optional rerank API.
-
-    The embeddings API must serve the model the FAISS index was built with
-    (bge-large-en-v1.5, 1024 dims). The rerank model is free to vary; when no
-    rerank endpoint is configured, results keep the vector-distance ordering.
+    Retrieval always goes through the hosted SciAtlas KG (/v1/search); relevance
+    reranking is done by the pipeline LLM in small batches, so no local
+    embedding or cross-encoder models are required.
     """
 
-    def __init__(self, config: IdeaRubricConfig) -> None:
-        self.index, self.metadata_store = _load_faiss_assets(config)
-        self.embed_url = _join_api_url(config.embed_api_base_url, "embeddings")
-        self.embed_key = config.embed_api_key or config.llm_api_key or ""
-        self.embed_model = config.embed_api_model or DEFAULT_EMBED_API_MODEL
-        self.rerank_url = (
-            _join_api_url(config.rerank_api_base_url, "rerank") if config.rerank_api_base_url else ""
-        )
-        self.rerank_key = config.rerank_api_key or self.embed_key
-        self.rerank_model = config.rerank_api_model or DEFAULT_RERANK_API_MODEL
-        if not config.embed_api_base_url or not self.embed_key:
-            raise ValueError(
-                "API search mode requires EMBED_API_BASE_URL and an API key (EMBED_API_KEY or the LLM API key)"
-            )
-
-    def _post_json(self, url: str, payload: dict[str, Any], api_key: str, timeout: int) -> dict[str, Any]:
-        response = requests.post(
-            url,
-            json=payload,
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    def _embed_query(self, idea: str) -> np.ndarray:
-        data = self._post_json(
-            self.embed_url,
-            {"model": self.embed_model, "input": [DEFAULT_QUERY_PREFIX + idea]},
-            self.embed_key,
-            60,
-        )
-        vector = np.asarray(data["data"][0]["embedding"], dtype="float32")
-        norm = float(np.linalg.norm(vector))
-        if norm > 0:
-            vector = vector / norm
-        return vector
-
-    def _rerank_scores(self, idea: str, retrieved_docs: list[dict[str, Any]]) -> list[float] | None:
-        if not self.rerank_url or not self.rerank_key or not retrieved_docs:
-            return None
-        payload = {
-            "model": self.rerank_model,
-            "query": idea,
-            "documents": [doc["doc_text"] for doc in retrieved_docs],
-            "top_n": len(retrieved_docs),
-        }
-        data = self._post_json(self.rerank_url, payload, self.rerank_key, 120)
-        results = data.get("results") if isinstance(data.get("results"), list) else data.get("data")
-        if not isinstance(results, list):
-            return None
-        scores: dict[int, float] = {}
-        for item in results:
-            if not isinstance(item, dict):
-                continue
-            position = item.get("index")
-            score = item.get("relevance_score", item.get("score"))
-            if isinstance(position, int) and score is not None:
-                scores[position] = float(score)
-        return [scores.get(position, 0.0) for position in range(len(retrieved_docs))]
+    def __init__(self, config: IdeaRubricConfig, *, call_llm: Any) -> None:
+        self.config = config
+        self._call_llm = call_llm
 
     def search(self, idea: str, *, top_k: int, final_k: int) -> list[dict[str, Any]]:
-        query_vector = self._embed_query(idea)
-        retrieved_docs = _faiss_recall(self.index, self.metadata_store, query_vector, idea, top_k)
-        try:
-            scores = self._rerank_scores(idea, retrieved_docs)
-        except Exception as exc:
-            print(f"[ApiSearchEngine] rerank API failed, falling back to vector order: {exc}", file=sys.stderr)
-            scores = None
-        if scores is None:
-            return retrieved_docs[:final_k]
-        for index, doc in enumerate(retrieved_docs):
-            doc["rerank_score"] = scores[index]
-        return sorted(retrieved_docs, key=lambda item: item["rerank_score"], reverse=True)[:final_k]
+        search = hosted_kg_search(query_text=idea, top_k=top_k, env_path=self.config.env_path)
+        docs = self._map_papers(idea, search["papers"])
+        if not docs:
+            raise RuntimeError("hosted KG search returned no candidate papers")
+        return self._rerank(idea, docs)[:final_k]
+
+    def _map_papers(self, idea: str, papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        idea_lower = idea.strip().lower()
+        docs: list[dict[str, Any]] = []
+        seen_titles: set[str] = set()
+        for paper in papers:
+            title = normalize_whitespace(paper.get("title"))
+            if not title or title.casefold() in seen_titles:
+                continue
+            if title.lower() in idea_lower:
+                continue
+            seen_titles.add(title.casefold())
+            docs.append(
+                {
+                    "Title": title,
+                    "Abstract": normalize_whitespace(paper.get("abstract")),
+                    "DOI": normalize_whitespace(paper.get("doi")),
+                    "venue": normalize_whitespace(paper.get("venue")),
+                    "publication_year": paper.get("publication_year"),
+                    "authors": paper.get("authors") or [],
+                    "paper_id": normalize_whitespace(paper.get("id")),
+                    "url": normalize_whitespace(paper.get("url")),
+                    "pdf_url": normalize_whitespace(paper.get("pdf_url")),
+                    "cited_by_count": paper.get("cited_by_count"),
+                    "kg_score": paper.get("score"),
+                    "source": "kg_hosted",
+                }
+            )
+        return docs
+
+    def _rerank(self, idea: str, docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        batch_size = max(2, int(self.config.rerank_batch_size or DEFAULT_RERANK_BATCH_SIZE))
+        batches = [docs[start : start + batch_size] for start in range(0, len(docs), batch_size)]
+        max_parallel = max(1, min(int(self.config.max_workers or DEFAULT_MAX_WORKERS), len(batches)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            futures = [executor.submit(self._score_batch, idea, batch) for batch in batches]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+        def sort_key(doc: dict[str, Any]) -> tuple[int, float, float]:
+            llm_score = doc.get("llm_score")
+            if llm_score is None:
+                return (0, 0.0, float(doc.get("kg_score") or 0.0))
+            return (1, float(llm_score), 0.0)
+
+        return sorted(docs, key=sort_key, reverse=True)
+
+    def _score_batch(self, idea: str, batch: list[dict[str, Any]]) -> None:
+        prompt = _build_rerank_prompt(idea, batch)
+        result = self._call_llm(
+            system_prompt=RERANK_SYSTEM_PROMPT,
+            user_content=prompt,
+            response_model_schema=RerankBatchScores,
+            temperature=0.1,
+            label="rubric_rerank",
+        )
+        if not isinstance(result, dict):
+            print("[KgRubricSearch] rerank batch failed; keeping KG order for its papers", file=sys.stderr)
+            return
+        for item in result.get("papers", []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                slot = int(item.get("paper_index"))
+                score = float(item.get("score"))
+            except (TypeError, ValueError):
+                continue
+            if slot < 1 or slot > len(batch):
+                continue
+            batch[slot - 1]["llm_score"] = round(max(0.0, min(10.0, score)), 4)
+            batch[slot - 1]["rerank_reason"] = normalize_whitespace(item.get("reason"))
 
 
 class IdeaRubricRunner:
@@ -687,77 +574,6 @@ class IdeaRubricRunner:
             config.llm_api_key,
             _env_lookup(env_values, "LLM_API_KEY", "DMX-API-KEY", "DMX_API_KEY", "OPENAI_API_KEY"),
         )
-        embed_api_base_url = first_non_empty(
-            config.embed_api_base_url,
-            _env_lookup(env_values, "EMBED_API_BASE_URL", "EMBED_API_URL"),
-        )
-        embed_api_key = first_non_empty(
-            config.embed_api_key,
-            _env_lookup(env_values, "EMBED_API_KEY"),
-            llm_api_key,
-        )
-        rerank_api_base_url = first_non_empty(
-            config.rerank_api_base_url,
-            _env_lookup(env_values, "RERANK_API_BASE_URL", "RERANK_API_URL"),
-        )
-        rerank_api_key = first_non_empty(
-            config.rerank_api_key,
-            _env_lookup(env_values, "RERANK_API_KEY"),
-            embed_api_key,
-        )
-        search_mode = (
-            normalize_whitespace(config.search_mode)
-            or _env_lookup(env_values, "SCIATLAS_SEARCH_MODE", "RUBRIC_SEARCH_MODE")
-            or "auto"
-        ).lower()
-        if search_mode not in {"auto", "local", "api"}:
-            search_mode = "auto"
-        if search_mode == "auto":
-            search_mode = "api" if embed_api_base_url and embed_api_key else "local"
-        precomputed_root = first_non_empty(
-            config.precomputed_root,
-            _env_lookup(env_values, "RUBRIC_PRECOMPUTED_ROOT"),
-        )
-        if not precomputed_root and (DEFAULT_PRECOMPUTED_ROOT / "papers").is_dir():
-            precomputed_root = str(DEFAULT_PRECOMPUTED_ROOT)
-        faiss_index_path = first_non_empty(
-            config.faiss_index_path,
-            _env_lookup(env_values, "RUBRIC_FAISS_INDEX_PATH"),
-            DEFAULT_FAISS_INDEX_PATH,
-        )
-        nc_meta_path = first_non_empty(
-            config.nc_meta_path,
-            _env_lookup(env_values, "RUBRIC_NC_META_PATH"),
-            DEFAULT_NC_META_PATH,
-        )
-        if precomputed_root:
-            # The asset pack bundles the FAISS index and nc_meta.json; prefer them
-            # when the configured locations do not exist on this machine.
-            packed_index = Path(precomputed_root).expanduser() / "faiss_nc.index"
-            if not Path(faiss_index_path).expanduser().exists() and packed_index.is_file():
-                faiss_index_path = str(packed_index)
-            packed_meta = Path(precomputed_root).expanduser() / "nc_meta.json"
-            if not Path(nc_meta_path).expanduser().exists() and packed_meta.is_file():
-                nc_meta_path = str(packed_meta)
-        embed_model_path = first_non_empty(
-            config.embed_model_path,
-            _env_lookup(env_values, "RUBRIC_EMBED_MODEL_PATH", "INNOEVAL_EMBEDDING_MODEL_PATH"),
-            DEFAULT_EMBED_MODEL_PATH,
-        )
-        if not Path(embed_model_path).expanduser().exists():
-            # Fall back to models downloaded into <repo>/models/ (see README quickstart).
-            repo_embed_model = DEFAULT_LOCAL_MODELS_DIR / LOCAL_EMBED_MODEL_DIRNAME
-            if repo_embed_model.is_dir():
-                embed_model_path = str(repo_embed_model)
-        rerank_model_path = first_non_empty(
-            config.rerank_model_path,
-            _env_lookup(env_values, "RUBRIC_RERANK_MODEL_PATH", "INNOEVAL_RERANKER_MODEL_PATH"),
-            DEFAULT_RERANK_MODEL_PATH,
-        )
-        if not Path(rerank_model_path).expanduser().exists():
-            repo_rerank_model = DEFAULT_LOCAL_MODELS_DIR / LOCAL_RERANK_MODEL_DIRNAME
-            if repo_rerank_model.is_dir():
-                rerank_model_path = str(repo_rerank_model)
         return IdeaRubricConfig(
             target_idea=normalize_whitespace(config.target_idea),
             artifact_root=Path(config.artifact_root).expanduser().resolve(),
@@ -777,31 +593,10 @@ class IdeaRubricRunner:
             ),
             llm_temperature=float(config.llm_temperature),
             llm_timeout_seconds=int(config.llm_timeout_seconds),
-            embed_model_path=embed_model_path,
-            rerank_model_path=rerank_model_path,
-            faiss_index_path=faiss_index_path,
-            nc_meta_path=nc_meta_path,
-            precomputed_root=precomputed_root,
-            search_mode=search_mode,
-            embed_api_base_url=embed_api_base_url,
-            embed_api_key=embed_api_key,
-            embed_api_model=first_non_empty(
-                config.embed_api_model,
-                _env_lookup(env_values, "EMBED_API_MODEL"),
-                DEFAULT_EMBED_API_MODEL,
-            ),
-            rerank_api_base_url=rerank_api_base_url,
-            rerank_api_key=rerank_api_key,
-            rerank_api_model=first_non_empty(
-                config.rerank_api_model,
-                _env_lookup(env_values, "RERANK_API_MODEL"),
-                DEFAULT_RERANK_API_MODEL,
-            ),
             search_top_k=int(config.search_top_k),
             search_final_k=int(config.search_final_k),
             max_workers=int(config.max_workers),
-            embed_device=first_non_empty(config.embed_device, DEFAULT_EMBED_DEVICE),
-            rerank_device=first_non_empty(config.rerank_device, DEFAULT_RERANK_DEVICE),
+            rerank_batch_size=int(config.rerank_batch_size),
         )
 
     @property
@@ -840,36 +635,28 @@ class IdeaRubricRunner:
         title = normalize_whitespace(doc.get("Title")) or normalize_whitespace(doc.get("title")) or f"paper-{index}"
         return ensure_directory(self.sources_root / "papers" / f"{index:02d}_{slugify(title, limit=60)}")
 
-    def _precomputed_paper_dir(self, folder_name: Any) -> Path | None:
-        root = normalize_whitespace(self.config.precomputed_root)
-        name = normalize_whitespace(folder_name)
-        if not root or not name:
-            return None
-        candidate = Path(root).expanduser() / "papers" / name
-        return candidate if candidate.is_dir() else None
+    def _build_review_norms_content(self, doc: dict[str, Any]) -> str:
+        parts = [f"Paper title: {normalize_whitespace(doc.get('Title'))}"]
+        venue = normalize_whitespace(doc.get("venue"))
+        year = doc.get("publication_year")
+        if venue:
+            parts.append(f"Venue: {venue}")
+        if year not in (None, ""):
+            parts.append(f"Publication year: {year}")
+        cited_by = doc.get("cited_by_count")
+        if cited_by not in (None, ""):
+            parts.append(f"Citation count: {cited_by}")
+        abstract = normalize_whitespace(doc.get("Abstract")) or "[missing abstract]"
+        parts.append(f"Paper abstract:\n{abstract}")
+        persona_notes = _load_general_persona_notes()
+        if persona_notes:
+            parts.append("Reviewer-persona notes (how demanding reviewers evaluate submissions):\n" + "\n".join(f"- {note}" for note in persona_notes))
+        return "\n\n".join(parts)
 
-    def _seed_from_precomputed(self, precomputed_dir: Path | None, filename: str, target_path: Path) -> bool:
-        if target_path.exists():
-            return True
-        if precomputed_dir is None:
-            return False
-        source_path = precomputed_dir / filename
-        if not source_path.is_file():
-            return False
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source_path, target_path)
-        return True
-
-    def process_single_retrieved_paper_sources(self, doc: dict[str, Any]) -> dict[str, Any]:
+    def process_single_retrieved_paper_abstract(self, doc: dict[str, Any]) -> dict[str, Any]:
         paper_started_at = time.perf_counter()
-        source_folder = Path(normalize_whitespace(doc.get("source_folder_path") or doc.get("folder_path")))
         artifact_dir = Path(doc["artifact_dir"])
         title = normalize_whitespace(doc.get("Title"))
-        doi = normalize_whitespace(doc.get("DOI"))
-        folder_name = normalize_whitespace(doc.get("folder_name")) or (
-            source_folder.name if normalize_whitespace(doc.get("source_folder_path") or doc.get("folder_path")) else ""
-        )
-        precomputed_dir = self._precomputed_paper_dir(folder_name)
         timings_ms: dict[str, Any] = {}
 
         def finish(status: str, reason: str | None = None) -> dict[str, Any]:
@@ -893,72 +680,56 @@ class IdeaRubricRunner:
             )
             return payload
 
-        if not source_folder.exists() and precomputed_dir is None:
-            return finish("skipped", "source folder does not exist and no precomputed assets")
-
+        abstract = normalize_whitespace(doc.get("Abstract"))
         sections_path = artifact_dir / "extracted_sections.json"
         review_text_path = artifact_dir / "review_text.txt"
         source_meta_path = artifact_dir / "source_meta.json"
-        fully_precomputed = precomputed_dir is not None and (
-            (precomputed_dir / "summary.json").is_file() and (precomputed_dir / "dimensions.json").is_file()
-        )
+
+        write_json(sections_path, {"abstract": abstract, "full_text_available": False})
 
         if not review_text_path.exists():
             step_started_at = time.perf_counter()
-            seeded = self._seed_from_precomputed(precomputed_dir, "review_text.txt", review_text_path)
-            if seeded:
-                timings_ms["review_text"] = round((time.perf_counter() - step_started_at) * 1000, 1)
-                timings_ms["review_text_source"] = "precomputed"
+            norms_result = self.call_llm_with_retry(
+                system_prompt=ABSTRACT_REVIEW_NORMS_SYSTEM_PROMPT,
+                user_content=self._build_review_norms_content(doc),
+                response_model_schema=ReviewNorms,
+                temperature=0.2,
+                label=f"norms:{title}",
+            )
+            if isinstance(norms_result, dict) and norms_result.get("norms"):
+                norms = [normalize_whitespace(item) for item in norms_result["norms"] if normalize_whitespace(item)]
             else:
-                review_pdf_path = next(source_folder.glob("review*.pdf"), None)
-                peer_raw_text = _extract_pdf_text(review_pdf_path) if review_pdf_path is not None else ""
-                if not peer_raw_text:
-                    if not fully_precomputed:
-                        return finish(
-                            "skipped",
-                            "review PDF missing" if review_pdf_path is None else "review PDF text extraction failed",
-                        )
-                else:
-                    clean_review = _filter_review_report(peer_raw_text)
-                    _write_text(review_text_path, clean_review)
-                    timings_ms["review_text"] = round((time.perf_counter() - step_started_at) * 1000, 1)
-
-        if not sections_path.exists():
-            step_started_at = time.perf_counter()
-            seeded = self._seed_from_precomputed(precomputed_dir, "extracted_sections.json", sections_path)
-            if seeded:
-                timings_ms["sections"] = round((time.perf_counter() - step_started_at) * 1000, 1)
-                timings_ms["sections_source"] = "precomputed"
-            elif fully_precomputed:
-                # The LLM stage seeds summary/dimensions directly; raw sections are not needed.
-                timings_ms["sections_source"] = "skipped_precomputed_llm_artifacts"
-            else:
-                xml_content = _fetch_pmc_xml_by_doi(doi)
-                if not xml_content:
-                    timings_ms["sections"] = round((time.perf_counter() - step_started_at) * 1000, 1)
-                    return finish("skipped", "PMC XML unavailable")
-                sections = _parse_jats_xml_sections(xml_content)
-                if not any(sections.values()):
-                    timings_ms["sections"] = round((time.perf_counter() - step_started_at) * 1000, 1)
-                    return finish("skipped", "no parsed sections")
-                write_json(sections_path, sections)
-                timings_ms["sections"] = round((time.perf_counter() - step_started_at) * 1000, 1)
+                norms = []
+            if not norms:
+                # Deterministic degradation: reuse the general reviewer personas
+                # shipped with the repo instead of skipping the paper entirely.
+                norms = _load_general_persona_notes(limit=10)
+                timings_ms["norms_source"] = "persona_fallback"
+            if not norms:
+                return finish("skipped", "review norms generation failed")
+            _write_text(review_text_path, "\n".join(f"- {norm}" for norm in norms))
+            timings_ms["review_norms"] = round((time.perf_counter() - step_started_at) * 1000, 1)
 
         if not source_meta_path.exists():
             write_json(
                 source_meta_path,
                 {
                     "title": title,
-                    "doi": doi,
-                    "folder_name": folder_name,
-                    "precomputed_dir": str(precomputed_dir.resolve()) if precomputed_dir else None,
-                    "source_folder_path": str(source_folder.resolve()),
+                    "doi": normalize_whitespace(doc.get("DOI")),
+                    "venue": normalize_whitespace(doc.get("venue")),
+                    "publication_year": doc.get("publication_year"),
+                    "paper_id": normalize_whitespace(doc.get("paper_id")),
+                    "url": normalize_whitespace(doc.get("url")),
+                    "pdf_url": normalize_whitespace(doc.get("pdf_url")),
+                    "kg_score": doc.get("kg_score"),
+                    "llm_score": doc.get("llm_score"),
+                    "folder_name": normalize_whitespace(doc.get("folder_name")),
+                    "source": "kg_hosted",
                     "artifact_dir": str(artifact_dir.resolve()),
                 },
             )
 
         return finish("ok")
-
     def process_single_retrieved_paper_llm(self, doc: dict[str, Any]) -> dict[str, Any]:
         paper_started_at = time.perf_counter()
         artifact_dir = Path(doc["artifact_dir"])
@@ -991,13 +762,7 @@ class IdeaRubricRunner:
         summary_path = artifact_dir / "summary.json"
         dimensions_path = artifact_dir / "dimensions.json"
 
-        precomputed_dir = self._precomputed_paper_dir(doc.get("folder_name"))
-        summary_seeded = self._seed_from_precomputed(precomputed_dir, "summary.json", summary_path)
-        dimensions_seeded = self._seed_from_precomputed(precomputed_dir, "dimensions.json", dimensions_path)
         if summary_path.exists() and dimensions_path.exists():
-            if summary_seeded and dimensions_seeded:
-                timings_ms["precomputed_seeded"] = True
-                return finish("ok", "precomputed summary and dimensions seeded")
             return finish("ok")
 
         if not sections_path.exists():
@@ -1005,19 +770,38 @@ class IdeaRubricRunner:
         if not review_text_path.exists():
             return finish("skipped", "review text file missing")
 
+        try:
+            sections_payload = json.loads(sections_path.read_text(encoding="utf-8"))
+        except Exception:
+            sections_payload = {}
+        abstract_only = sections_payload.get("full_text_available") is False if isinstance(sections_payload, dict) else False
+
         if not summary_path.exists():
             step_started_at = time.perf_counter()
-            sections_text = sections_path.read_text(encoding="utf-8")
-            summary_data = self.call_llm_with_retry(
-                system_prompt="Extract factual summaries for EXACTLY 5 specific sections based on the provided JSON.",
-                user_content=sections_text,
-                response_model_schema=PaperSummary,
-                temperature=0.1,
-                label=f"summary:{title}",
-            )
-            if not summary_data:
-                timings_ms["summary"] = round((time.perf_counter() - step_started_at) * 1000, 1)
-                return finish("skipped", "summary LLM failed")
+            if abstract_only:
+                # KG candidates carry only the abstract; the deterministic summary
+                # avoids a per-paper LLM round trip.
+                abstract_text = normalize_whitespace(sections_payload.get("abstract")) if isinstance(sections_payload, dict) else ""
+                summary_data = {
+                    "paper_title": title or "Unknown",
+                    "abstract_content": [abstract_text] if abstract_text else [],
+                    "introduction_content": [],
+                    "methods_content": [],
+                    "results_content": [],
+                    "discussion_content": [],
+                }
+            else:
+                sections_text = sections_path.read_text(encoding="utf-8")
+                summary_data = self.call_llm_with_retry(
+                    system_prompt="Extract factual summaries for EXACTLY 5 specific sections based on the provided JSON.",
+                    user_content=sections_text,
+                    response_model_schema=PaperSummary,
+                    temperature=0.1,
+                    label=f"summary:{title}",
+                )
+                if not summary_data:
+                    timings_ms["summary"] = round((time.perf_counter() - step_started_at) * 1000, 1)
+                    return finish("skipped", "summary LLM failed")
             write_json(summary_path, summary_data)
             timings_ms["summary"] = round((time.perf_counter() - step_started_at) * 1000, 1)
 
@@ -1026,51 +810,76 @@ class IdeaRubricRunner:
             summary_dict = json.loads(summary_path.read_text(encoding="utf-8"))
             clean_review = review_text_path.read_text(encoding="utf-8")
 
-            def extract_module(name: str, json_key: str, text: str) -> tuple[str, list[dict[str, Any]], float]:
-                module_started_at = time.perf_counter()
-                if not text.strip():
-                    return json_key, [], 0.0
+            if abstract_only:
+                abstract_text = "\n".join(summary_dict.get("abstract_content", []))
+                user_content = (
+                    f"### Paper title:\n{title}\n\n"
+                    f"### Abstract summary:\n{abstract_text}\n\n"
+                    f"### Review norms:\n{clean_review}"
+                )
                 result = self.call_llm_with_retry(
-                    system_prompt=f"Extract reviewer standards specifically for the {name} section.",
-                    user_content=f"### Summary:\n{text}\n### Review:\n{clean_review}",
-                    response_model_schema=ModuleStandards,
+                    system_prompt=ABSTRACT_DIMENSIONS_SYSTEM_PROMPT,
+                    user_content=user_content,
+                    response_model_schema=PaperModuleDimensions,
                     temperature=0.1,
-                    label=f"module:{title}:{name}",
+                    label=f"dimensions:{title}",
                 )
-                standards = result.get("standards") if isinstance(result, dict) else None
-                elapsed_ms = round((time.perf_counter() - module_started_at) * 1000, 1)
-                self._log_timing(
-                    "module_done",
-                    title=title,
-                    module=name,
-                    status="ok" if isinstance(standards, list) else "skipped",
-                    elapsed_ms=elapsed_ms,
-                    standard_count=len(standards) if isinstance(standards, list) else 0,
-                )
-                return json_key, standards if isinstance(standards, list) else [], elapsed_ms
-
-            intro_text = "\n".join(
-                summary_dict.get("abstract_content", []) + summary_dict.get("introduction_content", [])
-            )
-            module_inputs = [
-                ("Introduction", "introduction_standards", intro_text),
-                ("Methods", "methods_standards", "\n".join(summary_dict.get("methods_content", []))),
-                ("Results", "results_standards", "\n".join(summary_dict.get("results_content", []))),
-                ("Discussion", "discussion_standards", "\n".join(summary_dict.get("discussion_content", []))),
-            ]
-            final_criteria: dict[str, list[dict[str, Any]]] = {key: [] for _, key, _ in module_inputs}
-            module_timings_ms: dict[str, float] = {}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(module_inputs)) as executor:
-                future_map = {
-                    executor.submit(extract_module, name, json_key, text): name
-                    for name, json_key, text in module_inputs
+                if not isinstance(result, dict):
+                    timings_ms["dimensions"] = round((time.perf_counter() - step_started_at) * 1000, 1)
+                    return finish("skipped", "dimension extraction LLM failed")
+                final_criteria = {
+                    "introduction_standards": result.get("introduction_standards") or [],
+                    "methods_standards": result.get("methods_standards") or [],
+                    "results_standards": result.get("results_standards") or [],
+                    "discussion_standards": result.get("discussion_standards") or [],
                 }
-                for future in concurrent.futures.as_completed(future_map):
-                    json_key, standards, elapsed_ms = future.result()
-                    final_criteria[json_key] = standards
-                    module_timings_ms[json_key] = elapsed_ms
-            timings_ms["dimensions"] = round((time.perf_counter() - step_started_at) * 1000, 1)
-            timings_ms["dimension_modules"] = module_timings_ms
+                timings_ms["dimensions"] = round((time.perf_counter() - step_started_at) * 1000, 1)
+            else:
+                def extract_module(name: str, json_key: str, text: str) -> tuple[str, list[dict[str, Any]], float]:
+                    module_started_at = time.perf_counter()
+                    if not text.strip():
+                        return json_key, [], 0.0
+                    result = self.call_llm_with_retry(
+                        system_prompt=f"Extract reviewer standards specifically for the {name} section.",
+                        user_content=f"### Summary:\n{text}\n### Review:\n{clean_review}",
+                        response_model_schema=ModuleStandards,
+                        temperature=0.1,
+                        label=f"module:{title}:{name}",
+                    )
+                    standards = result.get("standards") if isinstance(result, dict) else None
+                    elapsed_ms = round((time.perf_counter() - module_started_at) * 1000, 1)
+                    self._log_timing(
+                        "module_done",
+                        title=title,
+                        module=name,
+                        status="ok" if isinstance(standards, list) else "skipped",
+                        elapsed_ms=elapsed_ms,
+                        standard_count=len(standards) if isinstance(standards, list) else 0,
+                    )
+                    return json_key, standards if isinstance(standards, list) else [], elapsed_ms
+
+                intro_text = "\n".join(
+                    summary_dict.get("abstract_content", []) + summary_dict.get("introduction_content", [])
+                )
+                module_inputs = [
+                    ("Introduction", "introduction_standards", intro_text),
+                    ("Methods", "methods_standards", "\n".join(summary_dict.get("methods_content", []))),
+                    ("Results", "results_standards", "\n".join(summary_dict.get("results_content", []))),
+                    ("Discussion", "discussion_standards", "\n".join(summary_dict.get("discussion_content", []))),
+                ]
+                final_criteria = {key: [] for _, key, _ in module_inputs}
+                module_timings_ms: dict[str, float] = {}
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(module_inputs)) as executor:
+                    future_map = {
+                        executor.submit(extract_module, name, json_key, text): name
+                        for name, json_key, text in module_inputs
+                    }
+                    for future in concurrent.futures.as_completed(future_map):
+                        json_key, standards, elapsed_ms = future.result()
+                        final_criteria[json_key] = standards
+                        module_timings_ms[json_key] = elapsed_ms
+                timings_ms["dimensions"] = round((time.perf_counter() - step_started_at) * 1000, 1)
+                timings_ms["dimension_modules"] = module_timings_ms
             if not any(final_criteria.values()):
                 return finish("skipped", "dimension extraction returned no standards")
             write_json(dimensions_path, final_criteria)
@@ -1120,14 +929,14 @@ class IdeaRubricRunner:
 
     def build_sources(self) -> dict[str, Any]:
         ensure_directory(self.sources_root)
+        engine = KgRubricSearch(self.config, call_llm=self.call_llm_with_retry)
         self._log_timing(
             "search_engine",
-            mode=self.config.search_mode,
-            precomputed_root=self.config.precomputed_root or None,
-            embed_api_model=self.config.embed_api_model if self.config.search_mode == "api" else None,
-            rerank_api=self.config.rerank_api_base_url or None,
+            backend="hosted_kg",
+            top_k=self.config.search_top_k,
+            final_k=self.config.search_final_k,
+            rerank_batch_size=self.config.rerank_batch_size,
         )
-        engine = ApiSearchEngine(self.config) if self.config.search_mode == "api" else PaperSearchEngine(self.config)
         retrieved_docs = engine.search(
             self.config.target_idea,
             top_k=self.config.search_top_k,
@@ -1137,16 +946,15 @@ class IdeaRubricRunner:
             raise RuntimeError("Idea rubric search returned no candidate papers")
 
         for index, doc in enumerate(retrieved_docs, start=1):
-            doc["source_folder_path"] = normalize_whitespace(doc.get("folder_path"))
-            doc["folder_name"] = Path(doc["source_folder_path"]).name if doc["source_folder_path"] else ""
             doc["artifact_dir"] = str(self._build_doc_artifact_dir(index, doc).resolve())
+            doc["folder_name"] = Path(doc["artifact_dir"]).name
 
         retrieved_papers_path = self.sources_root / "retrieved_papers.json"
         write_json(retrieved_papers_path, {"papers": retrieved_docs})
 
         processing_results: list[dict[str, Any]] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-            future_map = {executor.submit(self.process_single_retrieved_paper_sources, doc): doc for doc in retrieved_docs}
+            future_map = {executor.submit(self.process_single_retrieved_paper_abstract, doc): doc for doc in retrieved_docs}
             for future in concurrent.futures.as_completed(future_map):
                 processing_results.append(future.result())
 

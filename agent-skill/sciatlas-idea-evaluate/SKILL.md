@@ -29,20 +29,16 @@ python run_sciatlas.py idea-evaluate -h
 If needed, fall back to `sciatlas idea-evaluate -h` after installing the full checkout.
 
 2. This dedicated workflow requires a full SciAtlas checkout. If it is missing, clone the repository, change into it, then run `python -m pip install -e ./sciatlas` and `python -m pip install -r requirements-workflows.txt`. Do not use the GitHub `#subdirectory=sciatlas` package-only installation for this workflow.
-3. Run `python scripts/check_rubric_setup.py`. If it reports missing models, assets, packages, or keys, fix them yourself following [Local Model Setup](#local-model-setup) before proceeding — the workflow cannot run without the local embedding/rerank models.
-4. Check current environment and `.env` for `SCIATLAS_API_KEY`, LLM settings, S2 settings, and KG settings before asking the user.
-5. If no SciAtlas token is configured, guide the user to `http://sciatlas.openkg.cn/register`; ask for email, verification code, and returned `sciatlas_xxx` token only when needed.
-6. If LLM/S2/KG credentials are required and missing, ask only for the missing values. Use the user's provider values without printing them back.
-7. Configure the current shell or `.env` yourself, then run the workflow.
+3. Check current environment and `.env` for `SCIATLAS_API_KEY`, LLM settings, S2 settings, and KG settings before asking the user. No local embedding/rerank models are needed: retrieval goes through the hosted SciAtlas KG and all reranking is done by the configured LLM.
+4. If no SciAtlas token is configured, guide the user to `http://sciatlas.openkg.cn/register`; ask for email, verification code, and returned `sciatlas_xxx` token only when needed.
+5. If LLM/S2/KG credentials are required and missing, ask only for the missing values. Use the user's provider values without printing them back.
+6. Configure the current shell or `.env` yourself, then run the workflow.
 
 Configure workflow credentials in `.env` or the shell:
 
 ```bash
 SCIATLAS_API_BASE_URL=http://sciatlas.openkg.cn
 SCIATLAS_API_KEY=<sciatlas-token>
-NEO4J_URI=<local-or-hosted-neo4j-uri>
-NEO4J_USER=<neo4j-user>
-NEO4J_PASSWORD=<neo4j-password>
 S2_API_KEY=<semantic-scholar-key>
 OPENAI_API_KEY=<llm-key>
 OPENAI_BASE_URL=https://api.deepseek.com
@@ -51,42 +47,7 @@ LLM_MODEL=deepseek-v4-flash
 
 The workflow also accepts `DMX-API-KEY`, `DMX_API_KEY`, `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_API_URL`, `SEARCH_LLM_API_KEY`, `SEARCH_LLM_API_URL`, and `SEARCH_LLM_MODEL`.
 
-## Local Model Setup
-
-The rubric and grounding stages run on two local models that you must download once — do this yourself with tool access, never ask the user to run download commands, and never substitute a remote embeddings service.
-
-First check what is missing (the script prints the exact fix commands):
-
-```bash
-python scripts/check_rubric_setup.py
-```
-
-Download both models (~1.3GB each) into `<repo>/models/`; the workflow auto-detects them there, so no environment variables are required:
-
-```bash
-pip install -r requirements-rubric.txt
-export HF_ENDPOINT=https://hf-mirror.com   # mainland-China mirror; omit when huggingface.co is reachable
-huggingface-cli download BAAI/bge-large-en-v1.5 --local-dir <repo>/models/bge-large-en-v1.5
-huggingface-cli download BAAI/bge-reranker-large --local-dir <repo>/models/bge-reranker-large
-python scripts/download_rubric_assets.py   # FAISS index + precomputed NC-paper artifacts (~160MB)
-```
-
-ModelScope alternative (mainland China, no mirror needed):
-
-```bash
-pip install modelscope
-modelscope download --model AI-ModelScope/bge-large-en-v1.5 --local_dir <repo>/models/bge-large-en-v1.5
-modelscope download --model BAAI/bge-reranker-large --local_dir <repo>/models/bge-reranker-large
-```
-
-Verification checklist before running the workflow:
-
-- `python scripts/check_rubric_setup.py` exits 0 — re-run it after every download or config change.
-- Directory names are exactly `bge-large-en-v1.5` / `bge-reranker-large` under `<repo>/models/` (auto-detection is name-based). Models kept elsewhere must be pinned with **absolute paths**: `RUBRIC_EMBED_MODEL_PATH` / `RUBRIC_RERANK_MODEL_PATH` (rubric retrieval), `INNOEVAL_EMBEDDING_MODEL_PATH` / `INNOEVAL_RERANKER_MODEL_PATH` (KG search / author profiling), `SCIATLAS_EMBEDDING_MODEL_PATH` / `SCIATLAS_RERANKER_MODEL_PATH` (grounding).
-- Each model directory contains `config.json` plus weights (`model.safetensors` or `pytorch_model.bin`).
-- The embedding model must be exactly `bge-large-en-v1.5` (1024 dims) — the rubric FAISS index was built with it; other embedding models will not match.
-- On shared GPU machines set `INNOEVAL_CUDA_DEVICES` to free GPU ids; CPU also works (slower).
-- The asset pack is always required: it provides the FAISS index, `nc_meta.json`, and per-paper precomputed artifacts (skipping Europe PMC fetches and per-paper LLM calls). When default dataset paths do not exist, index and metadata are auto-detected from the pack.
+Optional: a local Neo4j KG (`NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD`) can supply richer reviewer backgrounds. When it is unavailable, the workflow automatically falls back to the hosted backend and LLM-generated reviewer backgrounds — nothing to install.
 
 ## Run Plan
 
