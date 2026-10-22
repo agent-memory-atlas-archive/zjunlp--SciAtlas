@@ -1,0 +1,16 @@
+{
+  "date": "2026-10-11",
+  "source": "current SciAtlas working tree",
+  "sha256": {
+    "sciatlas/src/sciatlas/cli.py": "95ab8b7c4b8ffe22dd523543eb5bbd8260abc38968c13f438c89cee45c7a1dd6",
+    "sciatlas/src/sciatlas/skills.py": "e49bd6e6a1332915f512970e85c4288bce02ee4c6a08bb62b3aff6f2fb89b99f",
+    "literature_review_pipeline/downstream/lr_search/literature_review_search.py": "274a05f23806d22e01d9a1d29e7ed88fb172052102167071aa394927de4912db",
+    "literature_review_pipeline/downstream/lr_search/generate_literature_review_report.py": "4be5e9cd72c4da8b3968e2de152ffabf400dd3b3c8a05c38e6c884d0eedfdfe7",
+    "review_pipeline/pipeline.py": "393d693293c83a6deb34059f29599e722f331e80a7d9de9783212ace2b04bad3",
+    "review_pipeline/review/idea_rubric.py": "aededb10155ff58e2eb998448c5dc9b7ba2201613678d879391e860465f6ba98",
+    "sciatlas/evidence/grounding.py": "f4e65d5ed3db2133f94afdd10e227b16e32a5de5a0bd17ae9ae721f28b32f25a",
+    "sciatlas_idea_gen/pipeline.py": "a39367fc9e0b59ca567a58674f0b97e2d49eea2a8b28c19028557da5461f4d48",
+    "sciatlas_idea_gen/config.py": "8ee0dd8c0cbf39f972bb9eb9fdc5b913fce8d75e7f10dd7007308454906c9f2c",
+    "sciatlas_idea_gen/prompts.py": "66b684803af806ac64bdb2b8639f13fd48c70cae677fe19a9e25e74e2c072150"
+  }
+}

@@ -1,0 +1,18 @@
+# Development overlay: loads the plugin from TypeScript source via the dsh
+# source launcher (tsx). Use from the deepseek-harness checkout:
+#   pnpm dsh --profile web --patch ../dsh-sciatlas/cordis.dev.yml --dump-config
+- insert:
+    - id: sciatlas
+      name: '/Users/interstellar888/Desktop/资料库/ZJUNLP/SciAtlas-NMI/sciatlas-dsh/dsh-sciatlas/src/index.ts'
+      config:
+        # 单次图检索请求的超时（毫秒）。图遍历较慢，建议 5–7 分钟
+        # （300000–420000）；工具级兜底自动为 timeoutMs + 30s。
+        timeoutMs: 360000
+        research:
+          runsDir: runs/sciatlas-dsh
+          background: true
+          # 留空则继承调用者日志中的 DSH 模型路由。
+          llmProvider: ''
+          llmModel: ''
+          # PDF 输入需配置已运行的 GROBID HTTP 服务。
+          grobidBaseUrl: ''

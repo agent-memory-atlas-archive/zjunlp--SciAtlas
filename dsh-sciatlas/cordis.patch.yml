@@ -1,0 +1,11 @@
+- insert:
+    - id: sciatlas
+      name: 'dsh-sciatlas'
+      config:
+        # Per-request timeout for graph retrieval, in milliseconds. Graph
+        # walks are slow — 5–7 minutes (300000–420000) is recommended; the
+        # tool-level budget is timeoutMs + 30s automatically.
+        timeoutMs: 360000
+        research:
+          background: true
+          grobidBaseUrl: ''
